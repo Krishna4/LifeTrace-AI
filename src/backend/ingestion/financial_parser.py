@@ -23,13 +23,13 @@ INVALID_ENTITIES = {
 # Heuristic transaction patterns matching explicit payments/debts
 MONEY_PATTERNS = [
     # "paid Venu $500" or "transferred Venu $500"
-    r"(?:paid|sent|gave|transferred)\s+([A-Z][a-z]{2,})\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
+    r"(?:paid|sent|gave|transferred)\s+([A-Za-z]{2,})\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
     # "paid/sent $500 to Venu"
-    r"(?:paid|sent|gave|transferred|lent|borrowed)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|INR|GBP)?\s+(?:to|from)\s+([A-Z][a-z]{2,})",
+    r"(?:paid|sent|gave|transferred|lent|borrowed)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|INR|GBP)?\s+(?:to|from)\s+([A-Za-z]{2,})",
     # "Venu paid $500"
-    r"([A-Z][a-z]{2,})\s+(?:paid|sent|gave|transferred|borrowed|lent)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
+    r"([A-Za-z]{2,})\s+(?:paid|sent|gave|transferred|borrowed|lent)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
     # "$500 paid to Venu"
-    r"[\$€£]\s*(\d+(?:\.\d{1,2})?)\s+(?:paid to|transferred to|sent to|given to)\s+([A-Z][a-z]{2,})",
+    r"[\$€£]\s*(\d+(?:\.\d{1,2})?)\s+(?:paid to|transferred to|sent to|given to)\s+([A-Za-z]{2,})",
 ]
 
 

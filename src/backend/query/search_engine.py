@@ -246,7 +246,13 @@ def execute_unified_search(query: str, route: QueryRouteResponse) -> Dict[str, A
 
     # Fallback answer synthesis
     if not answer_parts:
-        final_answer = f"No direct match found for query: '{query}'. Storage contains empty or un-indexed records."
+        q_lower = query.lower()
+        if any(w in q_lower for w in ["transaction", "expense", "spend", "paid", "cost", "owe"]):
+            final_answer = "💰 **No financial transactions recorded yet.**\n\nNo monetary payments or debts were found in the database. You can record transactions manually under the **'💸 Financial Expenses'** tab or upload receipts/bank statements."
+        elif any(w in q_lower for w in ["event", "meeting", "log", "activity", "diary", "journal"]):
+            final_answer = "📅 **No personal events recorded yet.**\n\nNo life events or meetings were found matching your query. You can log events or write a free-text journal entry on the **'🏠 Home'** landing page."
+        else:
+            final_answer = f"No direct match found for query: '{query}'. Storage contains empty or un-indexed records."
     else:
         final_answer = "\n\n".join(answer_parts)
 
