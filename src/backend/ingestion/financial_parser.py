@@ -22,14 +22,16 @@ INVALID_ENTITIES = {
 
 # Heuristic transaction patterns matching explicit payments/debts
 MONEY_PATTERNS = [
-    # "paid Venu $500" or "transferred Venu $500"
-    r"(?:paid|sent|gave|transferred)\s+([A-Za-z]{2,})\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
+    # "spent/paid 1500 rupees/INR/$ at/for/to Tirumala/Zomato/Venu"
+    r"(?:spent|paid|bought|cost|charged|sent|transferred|gave|lent|borrowed)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP|rupees|rs)?\s*(?:at|for|to|on|in|from)?\s*([A-Za-z]{3,})?",
     # "paid/sent $500 to Venu"
-    r"(?:paid|sent|gave|transferred|lent|borrowed)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|INR|GBP)?\s+(?:to|from)\s+([A-Za-z]{2,})",
+    r"(?:paid|sent|gave|transferred|lent|borrowed|spent)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|INR|GBP|rupees|rs)?\s+(?:to|for|at|from)\s+([A-Za-z]{3,})",
+    # "paid Venu $500" or "transferred Venu $500"
+    r"(?:spent|paid|sent|gave|transferred)\s+([A-Za-z]{3,})\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP|rupees|rs)?",
     # "Venu paid $500"
-    r"([A-Za-z]{2,})\s+(?:paid|sent|gave|transferred|borrowed|lent)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP)?",
+    r"([A-Za-z]{3,})\s+(?:paid|sent|gave|transferred|borrowed|lent|spent)\s+[\$€£]?\s*(\d+(?:\.\d{1,2})?)\s*(USD|EUR|INR|GBP|rupees|rs)?",
     # "$500 paid to Venu"
-    r"[\$€£]\s*(\d+(?:\.\d{1,2})?)\s+(?:paid to|transferred to|sent to|given to)\s+([A-Za-z]{2,})",
+    r"[\$€£]\s*(\d+(?:\.\d{1,2})?)\s+(?:paid to|transferred to|sent to|given to)\s+([A-Za-z]{3,})",
 ]
 
 
@@ -109,8 +111,19 @@ def extract_financial_transactions(
                         continue
 
                     currency = "USD"
-                    if len(groups) >= 3 and groups[2]:
-                        currency = groups[2].upper()
+                    snippet_lower = snippet.lower()
+                    if "inr" in snippet_lower or "rupees" in snippet_lower or "rs" in snippet_lower:
+                        currency = "INR"
+                    elif "eur" in snippet_lower or "€" in snippet:
+                        currency = "EUR"
+                    elif "gbp" in snippet_lower or "£" in snippet:
+                        currency = "GBP"
+                    elif len(groups) >= 3 and groups[2]:
+                        c_str = groups[2].upper()
+                        if c_str in ["INR", "USD", "EUR", "GBP"]:
+                            currency = c_str
+                        elif c_str in ["RUPEES", "RS"]:
+                            currency = "INR"
 
                     dedup_key = (entity_clean, amount, currency)
                     if dedup_key in seen_keys:

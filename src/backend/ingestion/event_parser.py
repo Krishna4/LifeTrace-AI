@@ -141,27 +141,66 @@ def extract_personal_events(
 
 def process_journal_entry(raw_text: str, entry_date: Optional[date] = None) -> Dict[str, Any]:
     """
-    Uses local SLM (Qwen-2.5-1.5B via Ollama) to analyze a daily journal or free-form diary text,
-    generating a clean summary, mood tag, key insights, extracted events, and transactions.
+    Uses a SINGLE unified SLM call to analyze a free-text daily journal entry.
+    Simultaneously extracts: summary, mood, insights, personal life events AND financial transactions.
+    The same sentence (e.g. "Spent 1500 INR at Tirumala") produces BOTH a TRAVEL event and a transaction.
+    Falls back to separate rule-based extractors if Ollama is offline.
     """
+    from src.backend.ingestion.financial_parser import extract_financial_transactions
+
     journal_dt = entry_date or date.today()
+    today_str = journal_dt.isoformat()
+
+    # Default fallback values
     summary = raw_text[:200].strip()
     mood = "REFLECTIVE"
-    insights = []
+    insights: List[Any] = []
+    events: List[PersonalEventCreate] = []
+    transactions: List[Any] = []
 
     if is_ollama_online() and raw_text.strip():
-        prompt = f"""System: You analyze raw personal journal and diary entries.
-Summarize the journal entry in 2 clean sentences, infer the general mood (POSITIVE, REFLECTIVE, TIRED, EXCITING, ANXIOUS), and list 2 key insights or takeaways.
+        prompt = f"""System: You are a personal life and finance assistant analyzing a daily journal entry.
+From the text below, extract ALL of the following simultaneously in a single JSON response:
 
-Return JSON format:
+1. A clean 2-sentence summary
+2. Overall mood (POSITIVE | REFLECTIVE | TIRED | EXCITING | ANXIOUS)
+3. 2 key insights or takeaways
+4. All personal life events (meetings, travel, dining, health, social activities, reminders)
+5. All financial transactions (money spent, paid, given, borrowed)
+
+IMPORTANT: The same sentence CAN and SHOULD generate BOTH an event AND a transaction entry.
+Example: "Spent 1500 INR at Tirumala for Seva" -> 1 TRAVEL event + 1 transaction (Tirumala, 1500 INR)
+
+Return ONLY this JSON schema:
 {{
-  "summary": "Clean 2-sentence summary",
+  "summary": "Two sentence summary",
   "mood": "MOOD_NAME",
-  "key_insights": ["Insight 1", "Insight 2"]
+  "key_insights": ["insight 1", "insight 2"],
+  "events": [
+    {{
+      "title": "Short event title",
+      "category": "DAILY_EVENT | MEETING | TRAVEL | HEALTH | MILESTONE | REMINDER | DINING",
+      "event_date": "{today_str}",
+      "location": "Location or null",
+      "entity_person": "Person involved or null",
+      "details": "Details of the event"
+    }}
+  ],
+  "transactions": [
+    {{
+      "entity_person": "Person or merchant name (e.g. Tirumala, Zomato, Venu)",
+      "amount": 100.0,
+      "currency": "INR | USD | EUR | GBP",
+      "notes": "What the payment was for"
+    }}
+  ]
 }}
 
-Journal Text: "{raw_text[:1500].strip()}"
+Do NOT extract tax/legal section references as transactions.
+
+Journal Entry: "{raw_text[:2000].strip()}"
 JSON Output:"""
+
         try:
             payload = {
                 "model": OLLAMA_MODEL,
@@ -169,20 +208,70 @@ JSON Output:"""
                 "stream": False,
                 "format": "json",
             }
-            res = requests.post(OLLAMA_URL, json=payload, timeout=4.0)
+            res = requests.post(OLLAMA_URL, json=payload, timeout=8.0)
             if res.status_code == 200:
-                raw = res.json().get("response", "")
-                data = json.loads(raw)
+                raw_resp = res.json().get("response", "")
+                data = json.loads(raw_resp)
                 if isinstance(data, dict):
                     summary = data.get("summary") or summary
                     mood = str(data.get("mood", mood)).upper()
                     insights = data.get("key_insights") or []
-        except Exception as e:
-            logger.debug(f"SLM journal analysis warning: {e}")
 
-    events = extract_personal_events(raw_text)
-    from src.backend.ingestion.financial_parser import extract_financial_transactions
-    transactions = extract_financial_transactions(raw_text)
+                    # Parse events
+                    valid_cats = {"DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER", "DINING"}
+                    for item in (data.get("events") or []):
+                        if not isinstance(item, dict) or not item.get("title"):
+                            continue
+                        try:
+                            ev_date = date.fromisoformat(str(item.get("event_date") or today_str))
+                        except Exception:
+                            ev_date = journal_dt
+
+                        cat = str(item.get("category", "DAILY_EVENT")).upper()
+                        if cat not in valid_cats:
+                            cat = "DAILY_EVENT"
+
+                        events.append(PersonalEventCreate(
+                            title=str(item["title"]).strip(),
+                            category=cat,
+                            event_date=ev_date,
+                            location=str(item["location"]) if item.get("location") and str(item.get("location")).lower() not in ("null", "none", "") else None,
+                            entity_person=str(item["entity_person"]) if item.get("entity_person") and str(item.get("entity_person")).lower() not in ("null", "none", "") else None,
+                            details=str(item["details"]) if item.get("details") and str(item.get("details")).lower() not in ("null", "none", "") else None,
+                        ))
+
+                    # Parse transactions (SLM-extracted, no regex needed)
+                    from src.backend.models.pydantic_schemas import FinancialTransactionCreate
+                    for item in (data.get("transactions") or []):
+                        if not isinstance(item, dict) or not item.get("entity_person"):
+                            continue
+                        try:
+                            amt = float(item.get("amount") or 0)
+                        except Exception:
+                            continue
+                        if amt <= 0:
+                            continue
+
+                        currency_raw = str(item.get("currency") or "USD").upper()
+                        if currency_raw not in {"INR", "USD", "EUR", "GBP"}:
+                            currency_raw = "USD"
+
+                        transactions.append(FinancialTransactionCreate(
+                            entity_person=str(item["entity_person"]).strip().capitalize(),
+                            amount=amt,
+                            currency=currency_raw,
+                            transaction_date=journal_dt,
+                            notes=str(item.get("notes") or "From journal entry"),
+                        ))
+
+        except Exception as e:
+            logger.debug(f"SLM unified journal analysis warning: {e}")
+
+    # Offline fallback: use separate rule-based extractors when Ollama is unavailable
+    if not events and not transactions:
+        logger.info("SLM unavailable or returned empty — using offline rule-based extractors for journal")
+        events = extract_personal_events(raw_text)
+        transactions = extract_financial_transactions(raw_text)
 
     return {
         "raw_text": raw_text,
