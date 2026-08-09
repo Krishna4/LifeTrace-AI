@@ -119,6 +119,8 @@ def extract_personal_events(
                     cat = "MEETING"
                 elif re.search(r"flight|hotel|trip|travel", line, re.IGNORECASE):
                     cat = "TRAVEL"
+                elif re.search(r"food|zomato|swiggy|biryani|lunch|dinner|breakfast|restaurant|coffee", line, re.IGNORECASE):
+                    cat = "DINING"
                 elif re.search(r"doctor|gym|workout|health|clinic", line, re.IGNORECASE):
                     cat = "HEALTH"
                 elif re.search(r"birthday|graduated|joined|celebrated", line, re.IGNORECASE):

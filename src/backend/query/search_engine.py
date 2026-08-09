@@ -98,11 +98,11 @@ def synthesize_answer_slm(
 
     context_str = "\n\n".join(ctx_parts)
     prompt = (
-        "You are an intelligent personal assistant. Answer the user's question directly and concisely "
-        "using ONLY the provided context information. Include exact amounts, dates, locations, and person names when available.\n\n"
+        "You are an intelligent personal life assistant. Summarize the user's recorded personal events, daily activities, transactions, and document notes directly and warmly.\n"
+        "If personal event logs or transactions are present in the Context Information, list and describe them directly as the answer to the user's query.\n\n"
         f"Context Information:\n{context_str}\n\n"
         f"User Question: {query}\n\n"
-        "Concise Answer:"
+        "Natural Language Answer:"
     )
 
     try:
@@ -237,15 +237,12 @@ def execute_unified_search(query: str, route: QueryRouteResponse) -> Dict[str, A
         chunks = lancedb_store.hybrid_search(search_terms, limit=5)
         vector_chunks_found = [_sanitize_chunk(c) for c in chunks]
 
-        if chunks:
-            top_texts = [c["text_content"] for c in chunks[:3]]
-            slm_ans = synthesize_answer_slm(query, top_texts, transactions=transactions_found, events=events_found)
-            if slm_ans:
-                answer_parts.insert(0, slm_ans)
-            else:
-                extracted_ans = extract_context_answer(query, top_texts)
-                if extracted_ans and not answer_parts:
-                    answer_parts.append(extracted_ans)
+    # 3. Generative SLM Answer Synthesis (Runs whenever records or vector chunks are retrieved)
+    top_texts = [c["text_content"] for c in vector_chunks_found[:3]] if vector_chunks_found else []
+    if transactions_found or events_found or top_texts:
+        slm_ans = synthesize_answer_slm(query, context_chunks=top_texts, transactions=transactions_found, events=events_found)
+        if slm_ans:
+            answer_parts.insert(0, slm_ans)
 
     # Fallback answer synthesis
     if not answer_parts:
