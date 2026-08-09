@@ -44,6 +44,23 @@ class PersonalEventResponse(PersonalEventBase):
     created_at: datetime
 
 
+class JournalEntryRequest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    text: str = Field(..., min_length=3, description="Raw journal or diary text entry")
+    entry_date: Optional[date] = Field(default=None, description="Date of journal entry")
+
+
+class JournalEntryResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    summary: str
+    mood: str
+    key_insights: List[str]
+    extracted_events_count: int
+    extracted_transactions_count: int
+
+
 class DocumentCreate(BaseModel):
     model_config = ConfigDict(frozen=True)
 

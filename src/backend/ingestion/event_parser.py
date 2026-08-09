@@ -135,3 +135,59 @@ def extract_personal_events(
                 break
 
     return results
+
+
+def process_journal_entry(raw_text: str, entry_date: Optional[date] = None) -> Dict[str, Any]:
+    """
+    Uses local SLM (Qwen-2.5-1.5B via Ollama) to analyze a daily journal or free-form diary text,
+    generating a clean summary, mood tag, key insights, extracted events, and transactions.
+    """
+    journal_dt = entry_date or date.today()
+    summary = raw_text[:200].strip()
+    mood = "REFLECTIVE"
+    insights = []
+
+    if is_ollama_online() and raw_text.strip():
+        prompt = f"""System: You analyze raw personal journal and diary entries.
+Summarize the journal entry in 2 clean sentences, infer the general mood (POSITIVE, REFLECTIVE, TIRED, EXCITING, ANXIOUS), and list 2 key insights or takeaways.
+
+Return JSON format:
+{{
+  "summary": "Clean 2-sentence summary",
+  "mood": "MOOD_NAME",
+  "key_insights": ["Insight 1", "Insight 2"]
+}}
+
+Journal Text: "{raw_text[:1500].strip()}"
+JSON Output:"""
+        try:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+            }
+            res = requests.post(OLLAMA_URL, json=payload, timeout=4.0)
+            if res.status_code == 200:
+                raw = res.json().get("response", "")
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    summary = data.get("summary") or summary
+                    mood = str(data.get("mood", mood)).upper()
+                    insights = data.get("key_insights") or []
+        except Exception as e:
+            logger.debug(f"SLM journal analysis warning: {e}")
+
+    events = extract_personal_events(raw_text)
+    from src.backend.ingestion.financial_parser import extract_financial_transactions
+    transactions = extract_financial_transactions(raw_text)
+
+    return {
+        "raw_text": raw_text,
+        "entry_date": journal_dt,
+        "summary": summary,
+        "mood": mood,
+        "key_insights": insights,
+        "extracted_events": events,
+        "extracted_transactions": transactions,
+    }

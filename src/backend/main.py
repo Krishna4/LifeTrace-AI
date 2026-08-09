@@ -14,6 +14,8 @@ from src.backend.models.pydantic_schemas import (
     FinancialTransactionResponse,
     PersonalEventCreate,
     PersonalEventResponse,
+    JournalEntryRequest,
+    JournalEntryResponse,
     QueryRouteRequest,
     QueryRouteResponse,
 )
@@ -33,7 +35,7 @@ from src.backend.database.sqlite import (
     log_vector_sync_event,
     delete_document,
 )
-from src.backend.ingestion.event_parser import extract_personal_events
+from src.backend.ingestion.event_parser import extract_personal_events, process_journal_entry
 from src.backend.database.lancedb_store import LanceDBStore
 from src.backend.utils.memory_monitor import get_memory_usage, enforce_memory_ceiling
 from src.backend.ingestion.router import validate_file_size, get_file_type
@@ -375,6 +377,40 @@ def remove_event(event_id: int):
     if not success:
         raise HTTPException(status_code=404, detail="Event record not found")
     return {"message": f"Event #{event_id} deleted successfully."}
+
+
+@app.post("/api/v1/journal", summary="Log & Analyze Free-Text Daily Journal Entry", status_code=status.HTTP_201_CREATED)
+def submit_journal(entry: JournalEntryRequest):
+    """
+    Analyzes raw free-text daily diary/journal text using SLM, synthesizes a summary with insights & mood,
+    extracts structured events/expenses into SQLite, and indexes entry into LanceDB vector store.
+    """
+    from datetime import datetime
+    res = process_journal_entry(entry.text, entry_date=entry.entry_date)
+
+    for ev in res["extracted_events"]:
+        create_personal_event(ev)
+
+    for tx in res["extracted_transactions"]:
+        create_transaction(tx)
+
+    chunks = [{
+        "doc_id": 0,
+        "chunk_index": 0,
+        "text_content": f"Journal Entry ({res['entry_date']}) [Mood: {res['mood']}]: {res['raw_text']}",
+        "source_type": "journal",
+        "created_at": datetime.utcnow().isoformat(),
+    }]
+    lancedb_store = LanceDBStore()
+    lancedb_store.add_chunks(chunks)
+
+    return {
+        "summary": res["summary"],
+        "mood": res["mood"],
+        "key_insights": res["key_insights"],
+        "extracted_events_count": len(res["extracted_events"]),
+        "extracted_transactions_count": len(res["extracted_transactions"]),
+    }
 
 
 @app.post("/api/v1/query", summary="Execute RAG Query via SLM Router")

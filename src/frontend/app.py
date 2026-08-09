@@ -151,35 +151,68 @@ with tab_home:
                             st.error(f"Could not connect to FastAPI backend: {e}")
 
     with col_quick_log:
-        st.markdown("### ⚡ Quick Log Event")
-        st.caption("Fast daily check-in")
-        with st.form("quick_add_event_form"):
-            ev_title = st.text_input("Title / Activity", placeholder="e.g. Meeting with Alex / Flight to Hyd")
-            ev_category = st.selectbox("Category", ["DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER"])
-            ev_date = st.date_input("Event Date", date.today(), key="quick_ev_date")
-            ev_location = st.text_input("Location (Optional)", placeholder="e.g. Starbucks / Office Room 3B", key="quick_ev_loc")
-            ev_person = st.text_input("Person (Optional)", placeholder="e.g. Alex / Poojitha", key="quick_ev_person")
-            ev_details = st.text_area("Notes (Optional)", placeholder="Key takeaways...", height=80, key="quick_ev_details")
+        st.markdown("### ✍️ Daily Journal & Quick Log")
 
-            submitted_ev = st.form_submit_button("🚀 Save Event Entry", use_container_width=True)
-            if submitted_ev and ev_title.strip():
-                try:
-                    payload = {
-                        "title": ev_title.strip(),
-                        "category": ev_category,
-                        "event_date": ev_date.isoformat(),
-                        "location": ev_location.strip() if ev_location else None,
-                        "entity_person": ev_person.strip() if ev_person else None,
-                        "details": ev_details.strip() if ev_details else None,
-                    }
-                    post_res = requests.post(f"{API_URL}/events", json=payload, timeout=5)
-                    if post_res.status_code == 201:
-                        st.success(f"✅ Event '{ev_title}' saved!")
-                        st.rerun()
-                    else:
-                        st.error(f"Failed to save: {post_res.text}")
-                except Exception as ex:
-                    st.error(f"Error: {ex}")
+        log_type = st.radio("Entry Mode", ["✍️ Free-Text Journal (AI Tweaked)", "⚡ Quick Structured Event"], horizontal=True, label_visibility="collapsed")
+
+        if log_type == "✍️ Free-Text Journal (AI Tweaked)":
+            st.caption("Paste or type raw diary notes. AI extracts events, expenses, mood & key insights.")
+            with st.form("free_text_journal_form"):
+                j_date = st.date_input("Journal Date", date.today(), key="j_date")
+                j_text = st.text_area("Write your day's story / notes...", placeholder="e.g. Spent 1500 rupees at Tirumala for Seva with Poojitha, met Alex for coffee, and felt super energized!", height=160, key="j_text")
+
+                submitted_j = st.form_submit_button("✨ Analyze & Save Journal", use_container_width=True)
+                if submitted_j and j_text.strip():
+                    with st.spinner("Analyzing journal with local SLM..."):
+                        try:
+                            payload = {
+                                "text": j_text.strip(),
+                                "entry_date": j_date.isoformat(),
+                            }
+                            res = requests.post(f"{API_URL}/journal", json=payload, timeout=20)
+                            if res.status_code == 201:
+                                data = res.json()
+                                st.success("✅ Journal entry analyzed and saved!")
+                                st.markdown(f"**Mood Tag**: `{data.get('mood', 'REFLECTIVE')}`")
+                                st.markdown(f"**Summary**: {data.get('summary')}")
+                                if data.get("key_insights"):
+                                    st.markdown("**Key Insights**:")
+                                    for ins in data["key_insights"]:
+                                        st.caption(f"- {ins}")
+                                st.info(f"Extracted **{data.get('extracted_events_count', 0)} event(s)** & **{data.get('extracted_transactions_count', 0)} transaction(s)** into database!")
+                            else:
+                                st.error(f"Failed to process journal: {res.text}")
+                        except Exception as ex:
+                            st.error(f"Error processing journal: {ex}")
+        else:
+            st.caption("Fast structured event check-in")
+            with st.form("quick_add_event_form"):
+                ev_title = st.text_input("Title / Activity", placeholder="e.g. Meeting with Alex / Flight to Hyd")
+                ev_category = st.selectbox("Category", ["DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER"])
+                ev_date = st.date_input("Event Date", date.today(), key="quick_ev_date")
+                ev_location = st.text_input("Location (Optional)", placeholder="e.g. Starbucks / Office Room 3B", key="quick_ev_loc")
+                ev_person = st.text_input("Person (Optional)", placeholder="e.g. Alex / Poojitha", key="quick_ev_person")
+                ev_details = st.text_area("Notes (Optional)", placeholder="Key takeaways...", height=60, key="quick_ev_details")
+
+                submitted_ev = st.form_submit_button("🚀 Save Event Entry", use_container_width=True)
+                if submitted_ev and ev_title.strip():
+                    try:
+                        payload = {
+                            "title": ev_title.strip(),
+                            "category": ev_category,
+                            "event_date": ev_date.isoformat(),
+                            "location": ev_location.strip() if ev_location else None,
+                            "entity_person": ev_person.strip() if ev_person else None,
+                            "details": ev_details.strip() if ev_details else None,
+                        }
+                        post_res = requests.post(f"{API_URL}/events", json=payload, timeout=5)
+                        if post_res.status_code == 201:
+                            st.success(f"✅ Event '{ev_title}' saved!")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to save: {post_res.text}")
+                    except Exception as ex:
+                        st.error(f"Error: {ex}")
 
 
 # ==========================================
