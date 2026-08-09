@@ -38,6 +38,11 @@ def is_transaction_verified_by_slm(match_text: str) -> bool:
     Uses local SLM (Qwen-2.5-1.5B via Ollama) to perform zero-shot binary validation
     on candidate transaction statements. Returns True if verified as a real transaction, False if tax/manual section.
     """
+    text_lower = match_text.lower()
+    for invalid in ["section", "sec ", "tax act", "tax law", "chapter", "paragraph", "subsection"]:
+        if invalid in text_lower:
+            return False
+
     if not is_ollama_online():
         return True  # Fallback to strict regex blacklist if Ollama is offline
 
