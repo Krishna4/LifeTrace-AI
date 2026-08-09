@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caches & Test output
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Databases & Local Vector Stores
+*.db
+*.sqlite
+*.sqlite3
+personal_rag.db
+lancedb_data/
+.lancedb/
+
+# Uploaded Files & Temporary Directories
+uploads/*
+!uploads/.gitkeep
+tmp/
+temp/
+
+# Sensitive Information & Keys
+.env
+.env.local
+.env.*
+*.pem
+*.key
+.streamlit/secrets.toml
+
+# IDE & System Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-rag"
+version = "1.1.0"
+description = "Low-resource multimodal personal RAG system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "pydantic>=2.6.0",
+    "python-multipart>=0.0.9",
+    "lancedb>=0.5.0",
+    "pyarrow>=14.0.0",
+    "sentence-transformers>=2.3.0",
+    "faster-whisper>=1.0.0",
+    "trafilatura>=1.7.0",
+    "transformers>=4.38.0",
+    "streamlit>=1.31.0",
+    "requests>=2.31.0",
+    "psutil>=5.9.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+warn_return_any = true
+warn_unused_configs = true

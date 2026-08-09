@@ -1,0 +1,207 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Multimodal Personal RAG API",
+    "version": "1.0.0",
+    "description": "REST API backend serving ingestion, hybrid search, transaction management, and SLM query routing for PersonalRag."
+  },
+  "paths": {
+    "/api/v1/ingest/file": {
+      "post": {
+        "summary": "Ingest document, media, or image file",
+        "description": "Accepts multipart file upload (max 500MB). Routes file to faster-whisper, Florence-2, or text parser.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "File to ingest (max 500MB)"
+                  }
+                },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "File ingestion accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "document_id": { "type": "integer" },
+                    "status": { "type": "string", "example": "PROCESSING" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "File upload exceeds 500MB ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string", "example": "FILE_TOO_LARGE" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ingest/url": {
+      "post": {
+        "summary": "Ingest web page from URL",
+        "description": "Extracts main text using Trafilatura, parses monetary mentions, and indexes text into LanceDB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": { "type": "string", "format": "uri" }
+                },
+                "required": ["url"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "URL ingested successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "document_id": { "type": "integer" },
+                    "title": { "type": "string" },
+                    "chunks_indexed": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/query": {
+      "post": {
+        "summary": "Execute natural language RAG query",
+        "description": "Uses Ollama SLM router to direct query to SQL, LanceDB, or Hybrid execution path.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "query": { "type": "string", "example": "How much money did I pay Alex?" }
+                },
+                "required": ["query"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Query processed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "query": { "type": "string" },
+                    "target_engine": { "type": "string", "enum": ["SQL", "VECTOR", "HYBRID"] },
+                    "answer": { "type": "string" },
+                    "transactions": {
+                      "type": "array",
+                      "items": { "type": "object" }
+                    },
+                    "retrieved_chunks": {
+                      "type": "array",
+                      "items": { "type": "object" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/transactions": {
+      "get": {
+        "summary": "List financial transactions",
+        "parameters": [
+          { "name": "entity_person", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 50 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of transactions"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create manual transaction record",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entity_person": { "type": "string" },
+                  "amount": { "type": "number" },
+                  "currency": { "type": "string", "default": "USD" },
+                  "transaction_date": { "type": "string", "format": "date" },
+                  "notes": { "type": "string" }
+                },
+                "required": ["entity_person", "amount", "transaction_date"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Transaction created"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "summary": "System health and memory check",
+        "responses": {
+          "200": {
+            "description": "System status and current RAM consumption (MB)"
+          }
+        }
+      }
+    },
+    "/api/v1/sync": {
+      "post": {
+        "summary": "Trigger background vector sync reconciliation",
+        "responses": {
+          "200": {
+            "description": "Reconciliation job started"
+          }
+        }
+      }
+    }
+  }
+}
