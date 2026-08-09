@@ -85,24 +85,29 @@ def synthesize_answer_slm(
 
     ctx_parts = []
     if transactions:
-        tx_strs = [f"Person: {t.get('entity_person')}, Amount: ${t.get('amount')} {t.get('currency')}, Date: {t.get('transaction_date')}, Notes: {t.get('notes')}" for t in transactions]
-        ctx_parts.append("Financial Transaction Records:\n" + "\n".join(tx_strs))
+        tx_strs = [f"- {t.get('entity_person')}: {t.get('amount')} {t.get('currency')} on {t.get('transaction_date')} ({t.get('notes') or 'N/A'})" for t in transactions]
+        ctx_parts.append("Financial Transactions:\n" + "\n".join(tx_strs))
     if events:
-        ev_strs = [f"Title: {e.get('title')}, Category: {e.get('category')}, Date: {e.get('event_date')}, Person: {e.get('entity_person') or 'N/A'}, Location: {e.get('location') or 'N/A'}, Details: {e.get('details') or 'N/A'}" for e in events]
-        ctx_parts.append("Personal Life Event Logs:\n" + "\n".join(ev_strs))
+        ev_strs = [f"- [{e.get('category')}] {e.get('title')} on {e.get('event_date')} | Person: {e.get('entity_person') or 'N/A'} | Location: {e.get('location') or 'N/A'} | {e.get('details') or ''}" for e in events]
+        ctx_parts.append("Personal Life Events:\n" + "\n".join(ev_strs))
     if context_chunks:
-        ctx_parts.append("Document Context:\n" + "\n\n---\n\n".join(context_chunks[:3]))
+        ctx_parts.append("Document Notes:\n" + "\n\n---\n\n".join(context_chunks[:3]))
 
     if not ctx_parts:
         return None
 
     context_str = "\n\n".join(ctx_parts)
     prompt = (
-        "You are an intelligent personal life assistant. Summarize the user's recorded personal events, daily activities, transactions, and document notes directly and warmly.\n"
-        "If personal event logs or transactions are present in the Context Information, list and describe them directly as the answer to the user's query.\n\n"
+        "You are a personal life assistant with access to the user's private data.\n"
+        "Answer the question using ONLY the Context Information provided below.\n\n"
+        "STRICT RULES:\n"
+        "1. NEVER restate or echo the question — give a direct answer only.\n"
+        "2. If the answer is NOT found in the context, respond with exactly: \"I don't have [topic] information for [name] in your personal records.\"\n"
+        "3. Use names, dates, amounts, and locations exactly as they appear in the context.\n"
+        "4. Keep the answer concise — 1 to 4 sentences maximum.\n\n"
         f"Context Information:\n{context_str}\n\n"
-        f"User Question: {query}\n\n"
-        "Natural Language Answer:"
+        f"Question: {query}\n\n"
+        "Answer:"
     )
 
     try:
@@ -114,11 +119,21 @@ def synthesize_answer_slm(
         res = requests.post(OLLAMA_URL, json=payload, timeout=6.0)
         if res.status_code == 200:
             ans = res.json().get("response", "").strip()
-            if ans:
+            # Detect and reject echo responses: if the answer contains most of the question, discard it
+            q_words = set(query.lower().split())
+            ans_words = set(ans.lower().split())
+            overlap = q_words & ans_words
+            if len(ans) > 10 and len(overlap) / max(len(q_words), 1) < 0.75:
                 return ans
+            elif len(ans) > 10:
+                # Answer too similar to the question — return a grounded "not found" response
+                person = next((w for w in query.split() if w[0].isupper()), "that person")
+                topic = "address" if "address" in query.lower() else "that information"
+                return f"I don't have {topic} for {person} in your personal records."
     except Exception as e:
         logger.debug(f"Ollama SLM answer synthesis error: {e}")
     return None
+
 
 
 def extract_context_answer(query: str, context_chunks: List[str]) -> Optional[str]:

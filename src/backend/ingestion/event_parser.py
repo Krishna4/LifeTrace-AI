@@ -10,6 +10,36 @@ from src.backend.query.slm_router import is_ollama_online, OLLAMA_URL, OLLAMA_MO
 
 logger = logging.getLogger(__name__)
 
+# Known merchants/places that small LLMs may be unsure about.
+# Format: "merchant_name": (event_category, description_hint)
+KNOWN_MERCHANTS: Dict[str, tuple] = {
+    # Food delivery apps
+    "zomato":   ("DINING",     "Indian food delivery app"),
+    "swiggy":   ("DINING",     "Indian food delivery app"),
+    "uber eats":("DINING",     "Food delivery app"),
+    "blinkit":  ("DINING",     "Grocery/quick delivery app"),
+    "zepto":    ("DINING",     "Grocery/quick delivery app"),
+    # Temples & pilgrimages
+    "tirumala": ("TRAVEL",     "Hindu pilgrimage temple in Andhra Pradesh"),
+    "tirupati": ("TRAVEL",     "Hindu pilgrimage city / Tirumala temple"),
+    "vaishnodevi":("TRAVEL",   "Hindu pilgrimage shrine in Jammu"),
+    # Ride hailing
+    "uber":     ("TRAVEL",     "Ride-hailing service"),
+    "ola":      ("TRAVEL",     "Indian ride-hailing service"),
+    "rapido":   ("TRAVEL",     "Bike taxi service"),
+    # Coffee & cafes
+    "starbucks":("DINING",     "Coffee shop chain"),
+    "cafe coffee day":("DINING","Indian coffee chain"),
+    "costa coffee":("DINING",  "Coffee shop chain"),
+    # Grocery & retail
+    "amazon":   ("DAILY_EVENT","Online shopping"),
+    "flipkart": ("DAILY_EVENT","Indian online shopping"),
+    "bigbasket": ("DAILY_EVENT","Indian online grocery store"),
+    # Healthcare
+    "practo":   ("HEALTH",     "Online doctor consultation platform"),
+    "apollo":   ("HEALTH",     "Hospital / pharmacy chain"),
+}
+
 EVENT_KEYWORDS = [
     r"\b(?:meeting|appointment|sync|discussion|standup|call)\b",
     r"\b(?:flight|train|hotel|trip|travel|visited|stayed|arrived|departed|booked)\b",
@@ -159,6 +189,19 @@ def process_journal_entry(raw_text: str, entry_date: Optional[date] = None) -> D
     transactions: List[Any] = []
 
     if is_ollama_online() and raw_text.strip():
+        # Build merchant hints for any known names found in the text
+        text_lower = raw_text.lower()
+        merchant_hints = [
+            f"- '{name}' is a {desc} (event category: {cat})"
+            for name, (cat, desc) in KNOWN_MERCHANTS.items()
+            if name in text_lower
+        ]
+        merchant_hint_str = (
+            "\n\nMerchant/Place hints (use these for accurate categorisation):\n"
+            + "\n".join(merchant_hints)
+            if merchant_hints else ""
+        )
+
         prompt = f"""System: You are a personal life and finance assistant analyzing a daily journal entry.
 From the text below, extract ALL of the following simultaneously in a single JSON response:
 
@@ -166,10 +209,11 @@ From the text below, extract ALL of the following simultaneously in a single JSO
 2. Overall mood (POSITIVE | REFLECTIVE | TIRED | EXCITING | ANXIOUS)
 3. 2 key insights or takeaways
 4. All personal life events (meetings, travel, dining, health, social activities, reminders)
-5. All financial transactions (money spent, paid, given, borrowed)
+5. All financial transactions (money spent, paid, given, borrowed){merchant_hint_str}
 
 IMPORTANT: The same sentence CAN and SHOULD generate BOTH an event AND a transaction entry.
 Example: "Spent 1500 INR at Tirumala for Seva" -> 1 TRAVEL event + 1 transaction (Tirumala, 1500 INR)
+Example: "Ordered biryani from Zomato" -> 1 DINING event + 1 transaction (Zomato, amount if stated)
 
 Return ONLY this JSON schema:
 {{
