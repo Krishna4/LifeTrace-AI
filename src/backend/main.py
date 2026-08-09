@@ -395,7 +395,7 @@ def submit_journal(entry: JournalEntryRequest):
         create_transaction(tx)
 
     chunks = [{
-        "doc_id": 0,
+        "document_id": 0,
         "chunk_index": 0,
         "text_content": f"Journal Entry ({res['entry_date']}) [Mood: {res['mood']}]: {res['raw_text']}",
         "source_type": "journal",

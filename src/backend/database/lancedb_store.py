@@ -158,7 +158,7 @@ class LanceDBStore:
             record = {
                 "vector": embeddings[i],
                 "id": chunk.get("id", str(uuid.uuid4())),
-                "document_id": int(chunk["document_id"]),
+                "document_id": int(chunk.get("document_id", chunk.get("doc_id", 0))),
                 "chunk_index": int(chunk.get("chunk_index", i)),
                 "text_content": chunk["text_content"],
                 "bm25_tokens": self.preprocess_bm25_tokens(chunk["text_content"]),
