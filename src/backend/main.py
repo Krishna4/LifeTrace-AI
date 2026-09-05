@@ -3,7 +3,7 @@ import shutil
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.backend.models.pydantic_schemas import (
@@ -18,6 +18,7 @@ from src.backend.models.pydantic_schemas import (
     JournalEntryResponse,
     QueryRouteRequest,
     QueryRouteResponse,
+    LLMConfig,
 )
 from src.backend.database.sqlite import (
     init_db,
@@ -48,6 +49,7 @@ from src.backend.ingestion.trafilatura_extractor import extract_url_content
 from src.backend.ingestion.financial_parser import extract_financial_transactions
 from src.backend.query.slm_router import route_query_slm
 from src.backend.query.search_engine import execute_unified_search
+from src.backend.llm.llm_client import get_llm_client, configure_llm_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,8 +81,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LifeTrace AI API",
-    version="1.1.0",
-    description="Private Multimodal Intelligence, Personal Life Ledger & Expense Tracker System API",
+    version="1.2.0",
+    description="Private Multimodal Intelligence, Personal Life Ledger & Multi-User RAG API",
     lifespan=lifespan,
 )
 
@@ -98,8 +100,10 @@ app.add_middleware(
 def health_check():
     """Returns system status, RAM footprint, and database readiness."""
     mem_info = get_memory_usage()
+    llm_client = get_llm_client()
     return {
         "status": "healthy",
+        "active_llm_provider": llm_client.get_effective_provider(),
         "ram_usage_mb": mem_info["process_ram_mb"],
         "max_memory_ceiling_mb": mem_info["max_ceiling_mb"],
         "system_used_ram_mb": mem_info["system_used_ram_mb"],
@@ -107,11 +111,52 @@ def health_check():
     }
 
 
-def _process_document_background(doc_id: int, file_path: str, file_type: str, filename: str):
-    """Background worker for asynchronous document ingestion and vector indexing."""
+# --- LLM Configuration Endpoints ---
+
+@app.get("/api/v1/llm/config", summary="Get LLM Provider Configuration")
+def get_llm_config():
+    """Returns current active LLM provider and model configurations."""
+    client = get_llm_client()
+    return {
+        "provider": client.provider,
+        "effective_provider": client.get_effective_provider(),
+        "openrouter_configured": bool(client.openrouter_api_key),
+        "openrouter_model": client.openrouter_model,
+        "ollama_model": client.ollama_model,
+        "is_available": client.is_available(),
+    }
+
+
+@app.post("/api/v1/llm/config", summary="Update LLM Provider Configuration")
+def set_llm_config(config: LLMConfig):
+    """Dynamically updates active LLM provider, API keys, and model choices."""
+    client = configure_llm_client(
+        provider=config.provider,
+        openrouter_api_key=config.openrouter_api_key,
+        openrouter_model=config.openrouter_model,
+        ollama_model=config.ollama_model,
+    )
+    return {
+        "message": "LLM Configuration updated successfully.",
+        "provider": client.provider,
+        "effective_provider": client.get_effective_provider(),
+        "openrouter_model": client.openrouter_model,
+        "ollama_model": client.ollama_model,
+    }
+
+
+def _process_document_background(
+    doc_id: int,
+    file_path: str,
+    file_type: str,
+    filename: str,
+    username: str = "default_user",
+    is_secure: bool = False,
+):
+    """Background worker for asynchronous document ingestion, metadata tagging, and vector indexing."""
     import time
     start_t = time.time()
-    logger.info(f"⚙️ [Async Job #{doc_id}] Starting background processing for '{filename}' ({file_type})...")
+    logger.info(f"⚙️ [Async Job #{doc_id}] Starting processing for '{filename}' ({file_type}) for user '{username}' (Secure={is_secure})...")
     update_document_status(doc_id, "PROCESSING")
 
     extracted_text = ""
@@ -157,27 +202,45 @@ def _process_document_background(doc_id: int, file_path: str, file_type: str, fi
             extracted_text = res["text"]
             error_log = res.get("error")
 
-        update_document_status(doc_id, processing_status, error_log=error_log)
-        logger.info(f"📝 [Async Job #{doc_id}] Extracted {len(extracted_text)} characters in {time.time() - start_t:.2f}s")
+        extracted_bytes = len(extracted_text.encode('utf-8')) if extracted_text else 0
+        update_document_status(doc_id, processing_status, error_log=error_log, file_size_bytes=extracted_bytes)
+        logger.info(f"📝 [Async Job #{doc_id}] Extracted {len(extracted_text)} characters ({extracted_bytes} bytes) in {time.time() - start_t:.2f}s")
 
-        # Extract monetary transactions & personal events
+        # Extract monetary transactions & personal events with tenant isolation metadata
         if extracted_text:
-            txs = extract_financial_transactions(extracted_text, source_document_id=doc_id)
+            txs = extract_financial_transactions(
+                extracted_text, 
+                source_document_id=doc_id, 
+                username=username, 
+                is_secure=is_secure,
+            )
             if txs:
-                logger.info(f"💸 [Async Job #{doc_id}] Found {len(txs)} transaction(s)")
+                logger.info(f"💸 [Async Job #{doc_id}] Found {len(txs)} transaction(s) for user '{username}'")
                 for tx in txs:
                     create_transaction(tx)
 
-            events = extract_personal_events(extracted_text, source_document_id=doc_id)
+            events = extract_personal_events(
+                extracted_text, 
+                source_document_id=doc_id, 
+                username=username, 
+                is_secure=is_secure,
+            )
             if events:
-                logger.info(f"📅 [Async Job #{doc_id}] Found {len(events)} personal event(s)")
+                logger.info(f"📅 [Async Job #{doc_id}] Found {len(events)} personal event(s) for user '{username}'")
                 for ev in events:
                     create_personal_event(ev)
 
-            # Index into LanceDB
+            # Index into LanceDB with tenant metadata
             vec_start = time.time()
-            chunks = _chunk_text(extracted_text, doc_id, source_type=file_type)
-            logger.info(f"🧩 [Async Job #{doc_id}] Indexing {len(chunks)} chunk(s) into LanceDB...")
+            chunks = _chunk_text(
+                extracted_text, 
+                doc_id, 
+                source_type=file_type,
+                username=username,
+                is_secure=is_secure,
+                source_file=filename,
+            )
+            logger.info(f"🧩 [Async Job #{doc_id}] Indexing {len(chunks)} chunk(s) into LanceDB for '{username}'...")
             lancedb_store = LanceDBStore()
             count = lancedb_store.add_chunks(chunks)
             update_document_vector_sync(doc_id, "INDEXED")
@@ -191,15 +254,23 @@ def _process_document_background(doc_id: int, file_path: str, file_type: str, fi
 
 
 @app.post("/api/v1/ingest/file", summary="Ingest File (Async Background Job)", status_code=status.HTTP_202_ACCEPTED)
-def ingest_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Uploads file and enqueues an asynchronous background processing job (Returns < 50ms)."""
+def ingest_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    username: str = Form(default="default_user"),
+    is_secure: Any = Form(default=False),
+):
+    """Uploads file and enqueues an asynchronous background processing job with user metadata."""
     enforce_memory_ceiling()
+
+    is_sec = str(is_secure).lower() in ("true", "1", "t") if isinstance(is_secure, str) else bool(is_secure)
+    user_name = username or "default_user"
 
     file.file.seek(0, os.SEEK_END)
     file_size = file.file.tell()
     file.file.seek(0)
 
-    logger.info(f"📥 Received file upload request: '{file.filename}' ({file_size / (1024*1024):.2f} MB)")
+    logger.info(f"📥 Received file upload: '{file.filename}' ({file_size / (1024*1024):.2f} MB) for user '{user_name}' (Secure={is_sec})")
 
     try:
         validate_file_size(file_size)
@@ -222,25 +293,46 @@ def ingest_file(background_tasks: BackgroundTasks, file: UploadFile = File(...))
         file_path=file_path,
         file_type=file_type,
         file_size_bytes=file_size,
+        username=user_name,
+        is_secure=is_sec,
+        source_name=file.filename,
     )
     doc_rec = create_document(doc_create)
 
     # Schedule background task
-    background_tasks.add_task(_process_document_background, doc_rec.id, file_path, file_type, file.filename or "file")
+    background_tasks.add_task(
+        _process_document_background, 
+        doc_rec.id, 
+        file_path, 
+        file_type, 
+        file.filename or "file",
+        user_name,
+        is_sec,
+    )
 
     return {
         "document_id": doc_rec.id,
         "filename": file.filename,
         "file_type": file_type,
+        "username": user_name,
+        "is_secure": is_sec,
         "status": "PROCESSING",
         "message": "File uploaded successfully. Async background processing job enqueued.",
     }
 
 
 @app.post("/api/v1/ingest/files", summary="Ingest Multiple Files (Batch Async Jobs)", status_code=status.HTTP_202_ACCEPTED)
-def ingest_multiple_files(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
+def ingest_multiple_files(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    username: str = Form(default="default_user"),
+    is_secure: Any = Form(default=False),
+):
     """Uploads multiple files in batch and enqueues asynchronous background processing jobs."""
     enforce_memory_ceiling()
+
+    is_sec = str(is_secure).lower() in ("true", "1", "t") if isinstance(is_secure, str) else bool(is_secure)
+    user_name = username or "default_user"
 
     enqueued_jobs = []
     uploads_dir = "uploads"
@@ -266,19 +358,33 @@ def ingest_multiple_files(background_tasks: BackgroundTasks, files: List[UploadF
             file_path=file_path,
             file_type=file_type,
             file_size_bytes=file_size,
+            username=user_name,
+            is_secure=is_sec,
+            source_name=filename,
         )
         doc_rec = create_document(doc_create)
 
-        background_tasks.add_task(_process_document_background, doc_rec.id, file_path, file_type, filename)
+        background_tasks.add_task(
+            _process_document_background, 
+            doc_rec.id, 
+            file_path, 
+            file_type, 
+            filename,
+            user_name,
+            is_sec,
+        )
         enqueued_jobs.append({
             "document_id": doc_rec.id,
             "filename": filename,
             "file_type": file_type,
+            "username": user_name,
+            "is_secure": is_sec,
             "status": "PROCESSING",
         })
 
     return {
         "enqueued_count": len(enqueued_jobs),
+        "username": user_name,
         "jobs": enqueued_jobs,
         "message": f"Enqueued {len(enqueued_jobs)} file(s) for background ingestion.",
     }
@@ -286,32 +392,48 @@ def ingest_multiple_files(background_tasks: BackgroundTasks, files: List[UploadF
 
 @app.post("/api/v1/ingest/url", summary="Ingest URL (Async Background Job)", status_code=status.HTTP_202_ACCEPTED)
 def ingest_url(background_tasks: BackgroundTasks, req: IngestUrlRequest):
-    """Enqueues web URL scraping and indexing background job (Returns < 50ms)."""
+    """Enqueues web URL scraping and indexing background job with tenant isolation."""
     enforce_memory_ceiling()
-    logger.info(f"🌐 Received URL scraping request: '{req.url}'")
+    logger.info(f"🌐 Received URL scraping request: '{req.url}' for user '{req.username}'")
 
     file_type = "web"
     doc_create = DocumentCreate(
         file_path=req.url,
         file_type=file_type,
         file_size_bytes=0,
+        username=req.username,
+        is_secure=req.is_secure,
+        source_name=req.url,
     )
     doc_rec = create_document(doc_create)
 
-    background_tasks.add_task(_process_document_background, doc_rec.id, req.url, file_type, req.url)
+    background_tasks.add_task(
+        _process_document_background, 
+        doc_rec.id, 
+        req.url, 
+        file_type, 
+        req.url,
+        req.username,
+        req.is_secure,
+    )
 
     return {
         "document_id": doc_rec.id,
         "url": req.url,
+        "username": req.username,
         "status": "PROCESSING",
         "message": "Web URL job enqueued for background processing.",
     }
 
 
 @app.get("/api/v1/documents", summary="List Ingestion Jobs & Documents")
-def list_documents(limit: int = 50):
-    """Lists document ingestion jobs with real-time status and vector sync metrics."""
-    return get_all_documents(limit=limit)
+def list_documents(
+    username: Optional[str] = None,
+    include_secure: bool = True,
+    limit: int = 50,
+):
+    """Lists document ingestion jobs with real-time status and user isolation."""
+    return get_all_documents(username=username, include_secure=include_secure, limit=limit)
 
 
 @app.get("/api/v1/documents/{doc_id}", summary="Get Ingestion Job Status")
@@ -347,9 +469,19 @@ def delete_document_by_id(doc_id: int):
 
 
 @app.get("/api/v1/transactions", summary="List Financial Transactions")
-def list_transactions(entity_person: Optional[str] = None, limit: int = 50):
-    """Lists structured financial transactions, optionally filtered by counterparty name."""
-    return get_transactions(entity_person=entity_person, limit=limit)
+def list_transactions(
+    entity_person: Optional[str] = None,
+    username: Optional[str] = None,
+    include_secure: bool = True,
+    limit: int = 50,
+):
+    """Lists structured financial transactions with tenant isolation."""
+    return get_transactions(
+        entity_person=entity_person,
+        username=username,
+        include_secure=include_secure,
+        limit=limit,
+    )
 
 
 @app.post("/api/v1/transactions", summary="Create Manual Transaction", status_code=status.HTTP_201_CREATED)
@@ -359,15 +491,55 @@ def add_transaction(tx: FinancialTransactionCreate):
 
 
 @app.get("/api/v1/events", summary="List Personal Events & Daily Life Logs")
-def list_events(category: Optional[str] = None, entity_person: Optional[str] = None, limit: int = 50):
-    """Retrieves personal events and daily life logs filtered by category or person."""
-    return get_personal_events(category=category, entity_person=entity_person, limit=limit)
+def list_events(
+    category: Optional[str] = None,
+    entity_person: Optional[str] = None,
+    query: Optional[str] = None,
+    event_date: Optional[str] = None,
+    username: Optional[str] = None,
+    include_secure: bool = True,
+    limit: int = 50,
+):
+    """Retrieves personal events and daily life logs with tenant isolation and search filtering."""
+    return get_personal_events(
+        category=category,
+        entity_person=entity_person,
+        query_text=query,
+        event_date=event_date,
+        username=username,
+        include_secure=include_secure,
+        limit=limit,
+    )
 
 
 @app.post("/api/v1/events", summary="Create Personal Event Log", status_code=status.HTTP_201_CREATED)
 def add_event(ev: PersonalEventCreate):
-    """Manually logs a new personal event or daily life entry."""
-    return create_personal_event(ev)
+    """Manually logs a new personal event or daily life entry and indexes it into the vector store."""
+    from datetime import datetime
+    rec = create_personal_event(ev)
+    try:
+        loc_str = f" at {ev.location}" if ev.location else ""
+        person_str = f" with {ev.entity_person}" if ev.entity_person else ""
+        details_str = f". Details: {ev.details}" if ev.details else ""
+        event_text = f"Personal Life Event ({ev.event_date}) [{ev.category}]: {ev.title}{loc_str}{person_str}{details_str}"
+
+        chunks = [{
+            "document_id": ev.source_document_id or 0,
+            "chunk_index": 0,
+            "text_content": event_text,
+            "source_type": "event",
+            "username": ev.username,
+            "is_secure": ev.is_secure,
+            "source_file": "event",
+            "doc_type": "event",
+            "created_at": datetime.utcnow().isoformat(),
+        }]
+        lancedb_store = LanceDBStore()
+        lancedb_store.add_chunks(chunks)
+    except Exception as e:
+        logger.warning(f"Vector indexing event #{rec.id} warning: {e}")
+    return rec
+
 
 
 @app.delete("/api/v1/events/{event_id}", summary="Delete Personal Event Log")
@@ -382,11 +554,16 @@ def remove_event(event_id: int):
 @app.post("/api/v1/journal", summary="Log & Analyze Free-Text Daily Journal Entry", status_code=status.HTTP_201_CREATED)
 def submit_journal(entry: JournalEntryRequest):
     """
-    Analyzes raw free-text daily diary/journal text using SLM, synthesizes a summary with insights & mood,
+    Analyzes raw free-text daily diary/journal text using LLM, synthesizes a summary with insights & mood,
     extracts structured events/expenses into SQLite, and indexes entry into LanceDB vector store.
     """
     from datetime import datetime
-    res = process_journal_entry(entry.text, entry_date=entry.entry_date)
+    res = process_journal_entry(
+        entry.text, 
+        entry_date=entry.entry_date,
+        username=entry.username,
+        is_secure=entry.is_secure,
+    )
 
     for ev in res["extracted_events"]:
         create_personal_event(ev)
@@ -399,6 +576,10 @@ def submit_journal(entry: JournalEntryRequest):
         "chunk_index": 0,
         "text_content": f"Journal Entry ({res['entry_date']}) [Mood: {res['mood']}]: {res['raw_text']}",
         "source_type": "journal",
+        "username": entry.username,
+        "is_secure": entry.is_secure,
+        "source_file": "journal",
+        "doc_type": "journal",
         "created_at": datetime.utcnow().isoformat(),
     }]
     lancedb_store = LanceDBStore()
@@ -413,15 +594,21 @@ def submit_journal(entry: JournalEntryRequest):
     }
 
 
-@app.post("/api/v1/query", summary="Execute RAG Query via SLM Router")
+@app.post("/api/v1/query", summary="Execute RAG Query via LLM Router")
 def query_rag(req: QueryRouteRequest):
-    """Routes query via SLM into SQL, Vector, or Hybrid execution path."""
+    """Routes query via LLM into SQL, Vector, or Hybrid execution path with strict user data isolation."""
     enforce_memory_ceiling()
-    logger.info(f"💬 Received RAG query: '{req.query}'")
-    route = route_query_slm(req.query)
-    logger.info(f"🔀 SLM Query Router decision: [{route.target_engine}] - {route.rationale}")
-    search_result = execute_unified_search(req.query, route)
-    logger.info(f"🔍 Search complete. Answer generated.")
+    logger.info(f"💬 Received RAG query for user '{req.username}' (Secure={req.include_secure}): '{req.query}'")
+    route = route_query_slm(req.query, provider_override=req.llm_provider)
+    logger.info(f"🔀 LLM Query Router decision: [{route.target_engine}] - {route.rationale}")
+    search_result = execute_unified_search(
+        req.query, 
+        route, 
+        username=req.username, 
+        include_secure=req.include_secure,
+        provider_override=req.llm_provider,
+    )
+    logger.info(f"🔍 Search complete for user '{req.username}'. Answer generated.")
     return search_result
 
 
@@ -445,6 +632,7 @@ def reset_database():
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM transactions")
+        cursor.execute("DELETE FROM personal_events")
         cursor.execute("DELETE FROM documents")
         cursor.execute("DELETE FROM vector_sync_logs")
         conn.commit()
@@ -470,25 +658,23 @@ def reset_database():
     return {"status": "SUCCESS", "message": "Database and vector store reset to fresh start successfully."}
 
 
-def _chunk_text(text: str, doc_id: int, source_type: str = "text", chunk_size: int = 400) -> List[Dict[str, Any]]:
-    """Splits text into sliding character chunks."""
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    idx = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        segment = text[start:end].strip()
-        if segment:
-            chunks.append(
-                {
-                    "document_id": doc_id,
-                    "chunk_index": idx,
-                    "text_content": segment,
-                    "source_type": source_type,
-                }
-            )
-            idx += 1
-        start += chunk_size - 50  # 50 char overlap
-    return chunks
+def _chunk_text(
+    text: str, 
+    doc_id: int, 
+    source_type: str = "text", 
+    username: str = "default_user",
+    is_secure: bool = False,
+    source_file: str = "",
+    chunk_size: int = 700,
+) -> List[Dict[str, Any]]:
+    """Splits text into semantically cohesive chunks by sentence and paragraph boundaries."""
+    from src.backend.utils.chunker import semantic_chunk_text
+    return semantic_chunk_text(
+        text=text,
+        doc_id=doc_id,
+        source_type=source_type,
+        username=username,
+        is_secure=is_secure,
+        source_file=source_file,
+        target_chunk_size=chunk_size,
+    )

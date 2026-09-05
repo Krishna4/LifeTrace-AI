@@ -16,8 +16,7 @@ logger = logging.getLogger(__name__)
 def reconcile_vector_sync() -> Dict[str, Any]:
     """
     Background worker that fetches ALL documents with UNINDEXED or SYNC_FAILED status,
-    extracts their text using specialized extractors (PDF, DOCX, Audio, Image, Dynamic Guardrail),
-    generates embeddings, parses financial statements, and indexes them into LanceDB.
+    extracts their text, parses financial statements, and indexes them into LanceDB with tenant metadata.
     """
     from src.backend.main import _chunk_text
     from src.backend.ingestion.pdf_extractor import extract_pdf_text
@@ -48,7 +47,9 @@ def reconcile_vector_sync() -> Dict[str, Any]:
         file_path = doc.file_path
         filename = os.path.basename(file_path)
         file_type = doc.file_type
-        logger.info(f"⚙️ Reconciling doc #{doc.id}: '{filename}' ({file_type})...")
+        username = doc.username or "default_user"
+        is_secure = doc.is_secure or False
+        logger.info(f"⚙️ Reconciling doc #{doc.id}: '{filename}' ({file_type}) for user '{username}'...")
 
         try:
             update_document_status(doc.id, "PROCESSING")
@@ -75,7 +76,12 @@ def reconcile_vector_sync() -> Dict[str, Any]:
 
             if extracted_text and extracted_text.strip():
                 # Parse financial entries
-                txs = extract_financial_transactions(extracted_text, source_document_id=doc.id)
+                txs = extract_financial_transactions(
+                    extracted_text, 
+                    source_document_id=doc.id,
+                    username=username,
+                    is_secure=is_secure,
+                )
                 for tx in txs:
                     try:
                         create_transaction(tx)
@@ -83,7 +89,14 @@ def reconcile_vector_sync() -> Dict[str, Any]:
                         pass
 
                 # Index into LanceDB
-                chunks = _chunk_text(extracted_text, doc.id, source_type=file_type)
+                chunks = _chunk_text(
+                    extracted_text, 
+                    doc.id, 
+                    source_type=file_type,
+                    username=username,
+                    is_secure=is_secure,
+                    source_file=filename,
+                )
                 count = lancedb_store.add_chunks(chunks)
                 update_document_status(doc.id, "COMPLETED")
                 update_document_vector_sync(doc.id, "INDEXED")

@@ -1,11 +1,10 @@
 import re
 import os
-import requests
 import logging
 from datetime import date
 from typing import List, Optional
 from src.backend.models.pydantic_schemas import FinancialTransactionCreate
-from src.backend.query.slm_router import is_ollama_online, OLLAMA_URL, OLLAMA_MODEL
+from src.backend.llm.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,7 @@ MONEY_PATTERNS = [
 
 def is_transaction_verified_by_slm(match_text: str) -> bool:
     """
-    Uses local SLM (Qwen-2.5-1.5B via Ollama) to perform zero-shot binary validation
+    Uses active LLM to perform zero-shot binary validation
     on candidate transaction statements. Returns True if verified as a real transaction, False if tax/manual section.
     """
     text_lower = match_text.lower()
@@ -45,39 +44,44 @@ def is_transaction_verified_by_slm(match_text: str) -> bool:
         if invalid in text_lower:
             return False
 
-    if not is_ollama_online():
-        return True  # Fallback to strict regex blacklist if Ollama is offline
+    client = get_llm_client()
+    if not client.is_available():
+        return True  # Fallback to strict regex blacklist
 
-    prompt = f"""System: You are a financial transaction classifier.
-Question: Does this statement describe a real monetary transaction or payment to/from a person or merchant?
-Statement: "{match_text.strip()}"
-Answer strictly with YES or NO:"""
+    prompt = (
+        f"Question: Does this statement describe a real monetary transaction or payment to/from a person or merchant?\n"
+        f"Statement: \"{match_text.strip()}\"\n"
+        f"Answer strictly with YES or NO:"
+    )
 
     try:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=2.5)
-        if res.status_code == 200:
-            ans = res.json().get("response", "").strip().upper()
-            if "NO" in ans or "NOT" in ans:
+        ans = client.generate(
+            prompt=prompt,
+            system_prompt="You are a financial transaction classifier. Answer strictly YES or NO.",
+            temperature=0.1,
+            max_tokens=10,
+            timeout=3.0,
+        )
+        if ans:
+            ans_upper = ans.strip().upper()
+            if "NO" in ans_upper or "NOT" in ans_upper:
                 return False
-            if "YES" in ans:
+            if "YES" in ans_upper:
                 return True
     except Exception as e:
-        logger.debug(f"SLM verification bypassed: {e}")
+        logger.debug(f"LLM transaction verification bypassed: {e}")
 
     return True
 
 
 def extract_financial_transactions(
-    text: str, source_document_id: Optional[int] = None
+    text: str,
+    source_document_id: Optional[int] = None,
+    username: str = "default_user",
+    is_secure: bool = False,
 ) -> List[FinancialTransactionCreate]:
     """
-    Extracts explicit monetary transaction statements from text input into Pydantic models.
-    Uses regex for precise numerical parsing and local SLM for binary transaction verification.
+    Extracts explicit monetary transaction statements from text input into Pydantic models with user metadata.
     """
     if not text:
         return []
@@ -105,9 +109,9 @@ def extract_financial_transactions(
 
                     snippet = match.group(0).strip()
 
-                    # Verify snippet using local Ollama SLM
+                    # Verify snippet using LLM
                     if not is_transaction_verified_by_slm(snippet):
-                        logger.info(f"🚫 SLM rejected false positive candidate: '{snippet}'")
+                        logger.info(f"🚫 LLM rejected false positive candidate: '{snippet}'")
                         continue
 
                     currency = "USD"
@@ -136,8 +140,10 @@ def extract_financial_transactions(
                             amount=amount,
                             currency=currency,
                             transaction_date=date.today(),
-                            notes=f"Extracted from statement: '{snippet}' (SLM Verified)",
+                            notes=f"Extracted from statement: '{snippet}' (LLM Verified)",
                             source_document_id=source_document_id,
+                            username=username,
+                            is_secure=is_secure,
                         )
                         results.append(tx)
             except Exception as e:

@@ -2,20 +2,17 @@ import json
 import logging
 import os
 import re
-import requests
-from typing import Literal
+from typing import Literal, Optional
 from src.backend.models.pydantic_schemas import QueryRouteResponse
+from src.backend.llm.llm_client import get_llm_client, is_ollama_online
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b")
-
 SYSTEM_ROUTER_PROMPT = """You are an expert Query Router for a Personal RAG system.
 Given a user query, classify the query into exactly one of three target execution engines:
-1. "SQL": If the query asks about financial payments, expenses, numerical totals, or transactions (e.g. "How much did I pay Alex?").
-2. "VECTOR": If the query asks for conceptual document summaries, meeting notes, or general information (e.g. "What was discussed in the project meeting?").
-3. "HYBRID": If the query requires both financial totals AND context details (e.g. "Find receipt for Alex and summarize invoice details").
+1. "SQL": If the query asks about structured records, financial payments, expenses, totals, personal life events, daily logs, meetings, travel, health checkups, or schedules (e.g. "How much did I pay Alex?", "What events do I have today?", "Did I visit the dentist?").
+2. "VECTOR": If the query asks for conceptual document contents, uploaded articles, manuals, policies, or general textual information (e.g. "What does the employee handbook say about leave?").
+3. "HYBRID": If the query requires both structured data (financials/events) AND unstructured document context (e.g. "Find receipt for Alex and summarize invoice details", "List my meetings and summarize the project design document").
 
 You MUST respond strictly with a valid JSON object matching this schema:
 {
@@ -27,49 +24,45 @@ You MUST respond strictly with a valid JSON object matching this schema:
 """
 
 
-def is_ollama_online(host: str = "127.0.0.1", port: int = 11434) -> bool:
-    """Fast < 1ms socket check to determine if local Ollama service is listening."""
-    import socket
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.05)
-        res = sock.connect_ex((host, port))
-        sock.close()
-        return res == 0
-    except Exception:
-        return False
-
-
-def route_query_slm(query: str) -> QueryRouteResponse:
+def route_query_slm(query: str, provider_override: Optional[str] = None) -> QueryRouteResponse:
     """
-    Uses local Qwen-2.5-1.5B via Ollama API to classify query if Ollama is online.
-    Instantly uses zero-shot semantic embedding classification (< 2ms) if Ollama is offline.
+    Uses active LLM (OpenRouter free model / local Ollama) to classify query.
+    Instantly uses zero-shot semantic embedding classification (< 2ms) if LLMs are unavailable.
     """
-    if is_ollama_online():
+    client = get_llm_client()
+    if client.is_available():
         try:
-            payload = {
-                "model": OLLAMA_MODEL,
-                "prompt": f"{SYSTEM_ROUTER_PROMPT}\nUser Query: \"{query}\"\nJSON Output:",
-                "stream": False,
-                "format": "json",
-            }
-            res = requests.post(OLLAMA_URL, json=payload, timeout=2.0)
-            if res.status_code == 200:
-                raw = res.json().get("response", "")
-                data = json.loads(raw)
+            prompt = f"User Query: \"{query}\"\nJSON Output:"
+            raw = client.generate(
+                prompt=prompt,
+                system_prompt=SYSTEM_ROUTER_PROMPT,
+                json_mode=True,
+                temperature=0.1,
+                timeout=4.0,
+            )
+            if raw:
+                # Clean code fences if present
+                clean_json = raw.strip()
+                if clean_json.startswith("```"):
+                    clean_json = re.sub(r"^```(?:json)?", "", clean_json)
+                    clean_json = re.sub(r"```$", "", clean_json).strip()
+
+                data = json.loads(clean_json)
                 target = data.get("target_engine", "HYBRID").upper()
                 if target not in ["SQL", "VECTOR", "HYBRID"]:
                     target = "HYBRID"
 
+                active_provider = client.get_effective_provider()
                 return QueryRouteResponse(
                     query=query,
                     target_engine=target,  # type: ignore
                     sql_query=data.get("sql_query"),
                     vector_terms=data.get("vector_terms", query),
-                    rationale=data.get("rationale", "Classified by local Qwen SLM router"),
+                    rationale=data.get("rationale", f"Classified by {active_provider} LLM router"),
+                    active_provider=active_provider,
                 )
         except Exception as e:
-            logger.debug(f"Ollama SLM router request error ({e}). Using semantic embedding router.")
+            logger.debug(f"LLM router request error ({e}). Using semantic embedding router.")
 
     return classify_query_semantic(query)
 
@@ -84,9 +77,9 @@ def classify_query_semantic(query: str) -> QueryRouteResponse:
         store = LanceDBStore()
 
         prototypes = [
-            "financial payment expenses spending money transactions totals paid amount cost price salary balance",
-            "document details topic meeting notes article summary text info audio transcript",
-            "invoice receipt breakdown paid total and document context summary"
+            "financial payment expenses spending money transactions totals paid amount cost price salary balance personal life events meetings schedule daily log travel appointment doctor dentist activities",
+            "document details topic manual guide article handbook policy specification text info audio transcript",
+            "invoice receipt breakdown paid total and document context summary project plan and meetings"
         ]
 
         vecs = store.generate_embeddings([query] + prototypes)
@@ -107,14 +100,16 @@ def classify_query_semantic(query: str) -> QueryRouteResponse:
                 query=query,
                 target_engine="HYBRID",
                 vector_terms=query,
-                rationale=f"Semantic hybrid similarity (SQL: {sql_sim:.2f}, Vector: {vec_sim:.2f})",
+                rationale=f"Semantic hybrid similarity (SQL/Events: {sql_sim:.2f}, Vector: {vec_sim:.2f})",
+                active_provider="SEMANTIC_EMBEDDING",
             )
         elif sql_sim > vec_sim and sql_sim > 0.35:
             return QueryRouteResponse(
                 query=query,
                 target_engine="SQL",
                 vector_terms=query,
-                rationale=f"Semantic financial intent (Similarity: {sql_sim:.2f})",
+                rationale=f"Semantic financial/event intent (Similarity: {sql_sim:.2f})",
+                active_provider="SEMANTIC_EMBEDDING",
             )
         else:
             return QueryRouteResponse(
@@ -122,6 +117,7 @@ def classify_query_semantic(query: str) -> QueryRouteResponse:
                 target_engine="VECTOR",
                 vector_terms=query,
                 rationale=f"Semantic document/context intent (Similarity: {vec_sim:.2f})",
+                active_provider="SEMANTIC_EMBEDDING",
             )
     except Exception as e:
         logger.warning(f"Semantic classifier fallback to rule matcher: {e}")
@@ -136,28 +132,36 @@ def classify_query_rule_based(query: str) -> QueryRouteResponse:
         "total", "invoice", "receipt", "expense", "how much", "salary", "owed", 
         "balance", "income", "price", "transfer", "transferred", "payment", "transaction"
     ]
+    event_keywords = [
+        "event", "events", "meeting", "meetings", "appointment", "schedule", "scheduled", 
+        "travel", "trip", "flight", "doctor", "dentist", "hospital", "clinic", "gym", 
+        "workout", "dining", "dinner", "lunch", "breakfast", "daily log", "today", 
+        "yesterday", "tomorrow", "calendar", "milestone"
+    ]
     semantic_keywords = [
-        "summarize", "summary", "topic", "meeting", "note", "explain", "what is", 
+        "summarize", "summary", "topic", "note", "notes", "explain", "what is", 
         "about", "abut", "details", "detail", "info", "information", "tell me", 
-        "project", "audio", "video", "document"
+        "manual", "handbook", "policy", "audio", "video", "document"
     ]
 
     has_financial = any(k in q_lower for k in financial_keywords)
+    has_event = any(k in q_lower for k in event_keywords)
     has_semantic = any(k in q_lower for k in semantic_keywords)
 
-    if has_financial and has_semantic:
+    if (has_financial or has_event) and has_semantic:
         target: Literal["SQL", "VECTOR", "HYBRID"] = "HYBRID"
-        rationale = "Query requests both financial amounts and document context."
-    elif has_financial:
+        rationale = "Contains both structured (financial/event) and unstructured semantic keywords"
+    elif has_financial or has_event:
         target = "SQL"
-        rationale = "Query requests financial spending or transaction numbers."
+        rationale = "Contains structured financial or life event keywords"
     else:
         target = "VECTOR"
-        rationale = "Query requests conceptual document or semantic transcript search."
+        rationale = "Defaulting to unstructured document search"
 
     return QueryRouteResponse(
         query=query,
         target_engine=target,
         vector_terms=query,
         rationale=rationale,
+        active_provider="RULE_BASED",
     )

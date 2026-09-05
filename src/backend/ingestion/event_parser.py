@@ -1,41 +1,33 @@
 import json
 import re
 import os
-import requests
 import logging
 from datetime import date
 from typing import List, Optional, Dict, Any
 from src.backend.models.pydantic_schemas import PersonalEventCreate
-from src.backend.query.slm_router import is_ollama_online, OLLAMA_URL, OLLAMA_MODEL
+from src.backend.llm.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
 
 # Known merchants/places that small LLMs may be unsure about.
-# Format: "merchant_name": (event_category, description_hint)
 KNOWN_MERCHANTS: Dict[str, tuple] = {
-    # Food delivery apps
     "zomato":   ("DINING",     "Indian food delivery app"),
     "swiggy":   ("DINING",     "Indian food delivery app"),
     "uber eats":("DINING",     "Food delivery app"),
     "blinkit":  ("DINING",     "Grocery/quick delivery app"),
     "zepto":    ("DINING",     "Grocery/quick delivery app"),
-    # Temples & pilgrimages
     "tirumala": ("TRAVEL",     "Hindu pilgrimage temple in Andhra Pradesh"),
     "tirupati": ("TRAVEL",     "Hindu pilgrimage city / Tirumala temple"),
     "vaishnodevi":("TRAVEL",   "Hindu pilgrimage shrine in Jammu"),
-    # Ride hailing
     "uber":     ("TRAVEL",     "Ride-hailing service"),
     "ola":      ("TRAVEL",     "Indian ride-hailing service"),
     "rapido":   ("TRAVEL",     "Bike taxi service"),
-    # Coffee & cafes
     "starbucks":("DINING",     "Coffee shop chain"),
     "cafe coffee day":("DINING","Indian coffee chain"),
     "costa coffee":("DINING",  "Coffee shop chain"),
-    # Grocery & retail
     "amazon":   ("DAILY_EVENT","Online shopping"),
     "flipkart": ("DAILY_EVENT","Indian online shopping"),
     "bigbasket": ("DAILY_EVENT","Indian online grocery store"),
-    # Healthcare
     "practo":   ("HEALTH",     "Online doctor consultation platform"),
     "apollo":   ("HEALTH",     "Hospital / pharmacy chain"),
 }
@@ -49,21 +41,28 @@ EVENT_KEYWORDS = [
 ]
 
 
-def extract_events_with_slm(text: str, source_document_id: Optional[int] = None) -> List[PersonalEventCreate]:
+def extract_events_with_slm(
+    text: str,
+    source_document_id: Optional[int] = None,
+    username: str = "default_user",
+    is_secure: bool = False,
+) -> List[PersonalEventCreate]:
     """
-    Uses local SLM (Qwen-2.5-1.5B via Ollama) to extract structured daily events and milestones.
+    Uses active LLM (OpenRouter free model / local Ollama) to extract structured daily events and milestones.
     """
-    if not is_ollama_online() or not text:
+    client = get_llm_client()
+    if not client.is_available() or not text:
         return []
 
-    prompt = f"""System: You extract personal life events, meetings, travel, health logs, and milestones.
-Analyze the text snippet and extract structured events.
-
-Return JSON array of events matching this schema:
+    system_prompt = (
+        "You extract personal life events, meetings, travel, health logs, and milestones.\n"
+        "Return a JSON array of events."
+    )
+    user_prompt = f"""Analyze the text snippet and extract structured events matching this schema:
 [
   {{
     "title": "Short event title",
-    "category": "DAILY_EVENT" | "MEETING" | "TRAVEL" | "HEALTH" | "MILESTONE" | "REMINDER",
+    "category": "DAILY_EVENT" | "MEETING" | "TRAVEL" | "HEALTH" | "MILESTONE" | "REMINDER" | "DINING",
     "event_date": "YYYY-MM-DD",
     "location": "Optional location or null",
     "entity_person": "Optional person involved or null",
@@ -76,16 +75,20 @@ JSON Output:"""
 
     events: List[PersonalEventCreate] = []
     try:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-        }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=3.5)
-        if res.status_code == 200:
-            raw = res.json().get("response", "")
-            data = json.loads(raw)
+        raw = client.generate(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            json_mode=True,
+            temperature=0.1,
+            timeout=5.0,
+        )
+        if raw:
+            clean_json = raw.strip()
+            if clean_json.startswith("```"):
+                clean_json = re.sub(r"^```(?:json)?", "", clean_json)
+                clean_json = re.sub(r"```$", "", clean_json).strip()
+
+            data = json.loads(clean_json)
             if isinstance(data, dict) and "events" in data:
                 items = data["events"]
             elif isinstance(data, list):
@@ -104,7 +107,7 @@ JSON Output:"""
                         ev_date = date.today()
 
                     cat = str(item.get("category", "DAILY_EVENT")).upper()
-                    if cat not in ["DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER"]:
+                    if cat not in ["DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER", "DINING"]:
                         cat = "DAILY_EVENT"
 
                     ev = PersonalEventCreate(
@@ -115,16 +118,21 @@ JSON Output:"""
                         entity_person=str(item.get("entity_person")) if item.get("entity_person") and str(item.get("entity_person")).lower() != "null" else None,
                         details=str(item.get("details")) if item.get("details") and str(item.get("details")).lower() != "null" else None,
                         source_document_id=source_document_id,
+                        username=username,
+                        is_secure=is_secure,
                     )
                     events.append(ev)
     except Exception as e:
-        logger.debug(f"SLM event extraction warning: {e}")
+        logger.debug(f"LLM event extraction warning: {e}")
 
     return events
 
 
 def extract_personal_events(
-    text: str, source_document_id: Optional[int] = None
+    text: str,
+    source_document_id: Optional[int] = None,
+    username: str = "default_user",
+    is_secure: bool = False,
 ) -> List[PersonalEventCreate]:
     """
     Extracts personal events, meetings, travel logs, and health entries from text input.
@@ -132,8 +140,8 @@ def extract_personal_events(
     if not text:
         return []
 
-    # 1. Try SLM extraction first
-    events = extract_events_with_slm(text, source_document_id)
+    # 1. Try LLM extraction first
+    events = extract_events_with_slm(text, source_document_id, username=username, is_secure=is_secure)
     if events:
         return events
 
@@ -162,6 +170,8 @@ def extract_personal_events(
                     event_date=date.today(),
                     details=line,
                     source_document_id=source_document_id,
+                    username=username,
+                    is_secure=is_secure,
                 )
                 results.append(ev)
                 break
@@ -169,27 +179,30 @@ def extract_personal_events(
     return results
 
 
-def process_journal_entry(raw_text: str, entry_date: Optional[date] = None) -> Dict[str, Any]:
+def process_journal_entry(
+    raw_text: str,
+    entry_date: Optional[date] = None,
+    username: str = "default_user",
+    is_secure: bool = False,
+) -> Dict[str, Any]:
     """
-    Uses a SINGLE unified SLM call to analyze a free-text daily journal entry.
+    Uses a unified LLM call (OpenRouter or Ollama) to analyze a free-text daily journal entry.
     Simultaneously extracts: summary, mood, insights, personal life events AND financial transactions.
-    The same sentence (e.g. "Spent 1500 INR at Tirumala") produces BOTH a TRAVEL event and a transaction.
-    Falls back to separate rule-based extractors if Ollama is offline.
     """
     from src.backend.ingestion.financial_parser import extract_financial_transactions
+    from src.backend.models.pydantic_schemas import FinancialTransactionCreate
 
     journal_dt = entry_date or date.today()
     today_str = journal_dt.isoformat()
 
-    # Default fallback values
     summary = raw_text[:200].strip()
     mood = "REFLECTIVE"
     insights: List[Any] = []
     events: List[PersonalEventCreate] = []
     transactions: List[Any] = []
 
-    if is_ollama_online() and raw_text.strip():
-        # Build merchant hints for any known names found in the text
+    client = get_llm_client()
+    if client.is_available() and raw_text.strip():
         text_lower = raw_text.lower()
         merchant_hints = [
             f"- '{name}' is a {desc} (event category: {cat})"
@@ -202,18 +215,14 @@ def process_journal_entry(raw_text: str, entry_date: Optional[date] = None) -> D
             if merchant_hints else ""
         )
 
-        prompt = f"""System: You are a personal life and finance assistant analyzing a daily journal entry.
-From the text below, extract ALL of the following simultaneously in a single JSON response:
+        system_prompt = "You are a personal life and finance assistant analyzing a daily journal entry. Return clean structured JSON."
+        user_prompt = f"""From the text below, extract ALL of the following simultaneously in a single JSON response:
 
 1. A clean 2-sentence summary
 2. Overall mood (POSITIVE | REFLECTIVE | TIRED | EXCITING | ANXIOUS)
 3. 2 key insights or takeaways
 4. All personal life events (meetings, travel, dining, health, social activities, reminders)
 5. All financial transactions (money spent, paid, given, borrowed){merchant_hint_str}
-
-IMPORTANT: The same sentence CAN and SHOULD generate BOTH an event AND a transaction entry.
-Example: "Spent 1500 INR at Tirumala for Seva" -> 1 TRAVEL event + 1 transaction (Tirumala, 1500 INR)
-Example: "Ordered biryani from Zomato" -> 1 DINING event + 1 transaction (Zomato, amount if stated)
 
 Return ONLY this JSON schema:
 {{
@@ -240,28 +249,29 @@ Return ONLY this JSON schema:
   ]
 }}
 
-Do NOT extract tax/legal section references as transactions.
-
 Journal Entry: "{raw_text[:2000].strip()}"
 JSON Output:"""
 
         try:
-            payload = {
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-            }
-            res = requests.post(OLLAMA_URL, json=payload, timeout=8.0)
-            if res.status_code == 200:
-                raw_resp = res.json().get("response", "")
-                data = json.loads(raw_resp)
+            raw_resp = client.generate(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                json_mode=True,
+                temperature=0.2,
+                timeout=8.0,
+            )
+            if raw_resp:
+                clean_json = raw_resp.strip()
+                if clean_json.startswith("```"):
+                    clean_json = re.sub(r"^```(?:json)?", "", clean_json)
+                    clean_json = re.sub(r"```$", "", clean_json).strip()
+
+                data = json.loads(clean_json)
                 if isinstance(data, dict):
                     summary = data.get("summary") or summary
                     mood = str(data.get("mood", mood)).upper()
                     insights = data.get("key_insights") or []
 
-                    # Parse events
                     valid_cats = {"DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER", "DINING"}
                     for item in (data.get("events") or []):
                         if not isinstance(item, dict) or not item.get("title"):
@@ -282,10 +292,10 @@ JSON Output:"""
                             location=str(item["location"]) if item.get("location") and str(item.get("location")).lower() not in ("null", "none", "") else None,
                             entity_person=str(item["entity_person"]) if item.get("entity_person") and str(item.get("entity_person")).lower() not in ("null", "none", "") else None,
                             details=str(item["details"]) if item.get("details") and str(item.get("details")).lower() not in ("null", "none", "") else None,
+                            username=username,
+                            is_secure=is_secure,
                         ))
 
-                    # Parse transactions (SLM-extracted, no regex needed)
-                    from src.backend.models.pydantic_schemas import FinancialTransactionCreate
                     for item in (data.get("transactions") or []):
                         if not isinstance(item, dict) or not item.get("entity_person"):
                             continue
@@ -306,16 +316,17 @@ JSON Output:"""
                             currency=currency_raw,
                             transaction_date=journal_dt,
                             notes=str(item.get("notes") or "From journal entry"),
+                            username=username,
+                            is_secure=is_secure,
                         ))
 
         except Exception as e:
-            logger.debug(f"SLM unified journal analysis warning: {e}")
+            logger.debug(f"LLM unified journal analysis warning: {e}")
 
-    # Offline fallback: use separate rule-based extractors when Ollama is unavailable
+    # Offline fallback
     if not events and not transactions:
-        logger.info("SLM unavailable or returned empty — using offline rule-based extractors for journal")
-        events = extract_personal_events(raw_text)
-        transactions = extract_financial_transactions(raw_text)
+        events = extract_personal_events(raw_text, username=username, is_secure=is_secure)
+        transactions = extract_financial_transactions(raw_text, username=username, is_secure=is_secure)
 
     return {
         "raw_text": raw_text,

@@ -11,6 +11,8 @@ class FinancialTransactionBase(BaseModel):
     currency: str = Field(default="USD", max_length=3, description="ISO currency code")
     transaction_date: date = Field(..., description="Date of transaction")
     notes: Optional[str] = Field(default=None, description="Optional notes or context")
+    username: str = Field(default="default_user", description="Owner username for multi-user isolation")
+    is_secure: bool = Field(default=False, description="Confidential / secure flag")
 
 
 class FinancialTransactionCreate(FinancialTransactionBase):
@@ -32,6 +34,8 @@ class PersonalEventBase(BaseModel):
     location: Optional[str] = Field(default=None, description="Location or venue")
     entity_person: Optional[str] = Field(default=None, description="People involved")
     details: Optional[str] = Field(default=None, description="Detailed notes or description")
+    username: str = Field(default="default_user", description="Owner username for multi-user isolation")
+    is_secure: bool = Field(default=False, description="Confidential / secure flag")
 
 
 class PersonalEventCreate(PersonalEventBase):
@@ -49,6 +53,8 @@ class JournalEntryRequest(BaseModel):
 
     text: str = Field(..., min_length=3, description="Raw journal or diary text entry")
     entry_date: Optional[date] = Field(default=None, description="Date of journal entry")
+    username: str = Field(default="default_user", description="Owner username for multi-user isolation")
+    is_secure: bool = Field(default=False, description="Confidential / secure flag")
 
 
 class JournalEntryResponse(BaseModel):
@@ -67,6 +73,10 @@ class DocumentCreate(BaseModel):
     file_path: str = Field(..., min_length=1)
     file_type: str = Field(..., min_length=1)
     file_size_bytes: int = Field(..., ge=0)
+    username: str = Field(default="default_user", description="Owner username for multi-user isolation")
+    is_secure: bool = Field(default=False, description="Confidential / secure flag")
+    source_name: Optional[str] = Field(default=None, description="Original filename or URL")
+    metadata_json: Optional[str] = Field(default=None, description="Extra metadata JSON")
 
 
 class DocumentResponse(BaseModel):
@@ -76,6 +86,9 @@ class DocumentResponse(BaseModel):
     file_path: str
     file_type: str
     file_size_bytes: int
+    username: str = "default_user"
+    is_secure: bool = False
+    source_name: Optional[str] = None
     status: Literal["PENDING", "PROCESSING", "COMPLETED", "PARTIAL_SUCCESS", "PARTIAL_TRANSCRIPT", "FAILED"]
     vector_sync_status: Literal["UNINDEXED", "INDEXED", "SYNC_FAILED"]
     error_log: Optional[str] = None
@@ -93,6 +106,10 @@ class TextChunkModel(BaseModel):
     text_content: str = Field(..., min_length=1)
     bm25_tokens: str = Field(default="")
     source_type: str = Field(default="text")
+    username: str = Field(default="default_user", description="Owner username for isolation")
+    is_secure: bool = Field(default=False, description="Confidential document chunk")
+    source_file: str = Field(default="", description="Source file name or origin")
+    doc_type: str = Field(default="text", description="Document type")
     timestamp_start: Optional[float] = None
     timestamp_end: Optional[float] = None
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -102,6 +119,9 @@ class QueryRouteRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     query: str = Field(..., min_length=1, description="Natural language question")
+    username: str = Field(default="default_user", description="Querying user identifier for tenant isolation")
+    include_secure: bool = Field(default=True, description="Whether to include secure/confidential documents")
+    llm_provider: Optional[str] = Field(default=None, description="Override LLM provider e.g. OPENROUTER or OLLAMA")
 
 
 class QueryRouteResponse(BaseModel):
@@ -115,9 +135,22 @@ class QueryRouteResponse(BaseModel):
     answer: Optional[str] = None
     transactions: List[Dict[str, Any]] = Field(default_factory=list)
     retrieved_chunks: List[Dict[str, Any]] = Field(default_factory=list)
+    active_provider: Optional[str] = None
 
 
 class IngestUrlRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     url: str = Field(..., min_length=5, description="Web page URL to ingest")
+    username: str = Field(default="default_user", description="Owner username for multi-user isolation")
+    is_secure: bool = Field(default=False, description="Confidential flag")
+
+
+class LLMConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: str = Field(default="AUTO", description="AUTO, OPENROUTER, OLLAMA, or NONE")
+    openrouter_api_key: Optional[str] = Field(default=None, description="OpenRouter API Key")
+    openrouter_model: Optional[str] = Field(default="meta-llama/llama-3.3-70b-instruct:free")
+    ollama_model: Optional[str] = Field(default="qwen2.5:1.5b")
+    is_active: bool = Field(default=True)
