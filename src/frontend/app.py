@@ -299,11 +299,29 @@ with tab_events:
     st.markdown(f"### 📅 Personal Life Ledger for `{active_user}`")
     st.caption("View daily life events, meeting summaries, travel itineraries, health notes, and personal milestones.")
 
-    col_e1, col_e2 = st.columns(2)
+    col_e1, col_e2, col_e3 = st.columns([2, 2, 1.5])
     with col_e1:
-        cat_filter = st.selectbox("Category Filter", ["ALL", "DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER"], key="ledger_cat_filter")
+        cat_filter = st.selectbox("Category Filter", ["ALL", "DAILY_EVENT", "MEETING", "TRAVEL", "HEALTH", "MILESTONE", "REMINDER", "DINING"], key="ledger_cat_filter")
     with col_e2:
         search_person = st.text_input("Filter by Person Involved", "", key="evt_person_search")
+    with col_e3:
+        st.write("")
+        st.write("")
+        if st.button("📲 Send to Telegram", use_container_width=True, help="Broadcasts today's scheduled agenda to your Telegram chat or channel"):
+            with st.spinner("Publishing agenda to Telegram..."):
+                try:
+                    t_res = requests.post(f"{API_URL}/telegram/publish-digest", params={"username": active_user}, timeout=10)
+                    if t_res.status_code == 200:
+                        t_data = t_res.json()
+                        delivery = t_data.get("delivery", {})
+                        if delivery.get("success"):
+                            st.success(f"✅ Published {t_data.get('events_count')} event(s) to Telegram!")
+                        else:
+                            st.warning(f"Telegram notice: {delivery.get('error', 'Not delivered. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID')}")
+                    else:
+                        st.error(f"Failed to publish: {t_res.text}")
+                except Exception as ex:
+                    st.error(f"Error connecting to Telegram service: {ex}")
 
     try:
         params: Dict[str, Any] = {
@@ -324,6 +342,7 @@ with tab_events:
                 st.info(f"No personal event logs found for user '{active_user}'.")
     except Exception as e:
         st.error(f"Error fetching event logs: {e}")
+
 
 
 # ==========================================

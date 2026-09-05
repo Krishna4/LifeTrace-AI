@@ -658,7 +658,41 @@ def reset_database():
     return {"status": "SUCCESS", "message": "Database and vector store reset to fresh start successfully."}
 
 
+# --- Telegram Bot & Publishing Endpoints ---
+
+@app.get("/api/v1/telegram/status", summary="Telegram Integration Status")
+def get_telegram_status():
+    """Checks whether Telegram Bot Token and Chat ID are configured."""
+    from src.backend.services.telegram_service import get_telegram_config
+    cfg = get_telegram_config()
+    return {
+        "is_configured": bool(cfg["bot_token"] and cfg["default_chat_id"]),
+        "has_token": bool(cfg["bot_token"]),
+        "has_chat_id": bool(cfg["default_chat_id"]),
+    }
+
+
+@app.post("/api/v1/telegram/publish-digest", summary="Publish Daily Agenda to Telegram")
+def trigger_daily_digest(
+    username: str = "default_user",
+    chat_id: Optional[str] = None,
+):
+    """Fetches today's agenda and broadcasts it to Telegram."""
+    from src.backend.services.telegram_service import publish_daily_digest
+    res = publish_daily_digest(username=username, chat_id=chat_id)
+    return res
+
+
+@app.post("/api/v1/telegram/webhook", summary="Telegram Webhook Receiver")
+async def telegram_webhook(update: Dict[str, Any]):
+    """Receives webhook payloads from Telegram Bot API and processes updates."""
+    from src.backend.services.telegram_service import handle_telegram_update
+    res = handle_telegram_update(update)
+    return {"ok": True, "result": res}
+
+
 def _chunk_text(
+
     text: str, 
     doc_id: int, 
     source_type: str = "text", 

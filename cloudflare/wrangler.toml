@@ -1,0 +1,30 @@
+name = "lifetrace-ai-edge"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 1. Cloudflare D1 Serverless Relational SQLite
+[[d1_databases]]
+binding = "DB"
+database_name = "personal-rag-db"
+database_id = "YOUR_D1_DATABASE_ID_HERE"
+
+# 2. Cloudflare Vectorize Vector Database
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "personal-rag-vectors"
+
+# 3. Cloudflare Workers AI (LLMs & Embeddings)
+[ai]
+binding = "AI"
+
+# 4. Automated Daily Morning Agenda Cron (Runs at 8:00 AM UTC / adjust for timezone)
+[triggers]
+crons = ["0 8 * * *"]
+
+# 5. Environment Variables & Secrets (Set via: npx wrangler secret put <NAME>)
+# - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_CHAT_ID
+[vars]
+ENVIRONMENT = "production"
+DEFAULT_USER = "default_user"

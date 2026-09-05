@@ -46,3 +46,9 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Node / Cloudflare
+node_modules/
+.wrangler/
+dist/
+
