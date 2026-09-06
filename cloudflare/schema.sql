@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 4. Conversation History (Multi-turn chat memory)
+CREATE TABLE IF NOT EXISTS conversation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- 'user' or 'assistant'
+    content TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT 'default_user',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indices for fast edge querying
 CREATE INDEX IF NOT EXISTS idx_personal_events_user ON personal_events(username);
 CREATE INDEX IF NOT EXISTS idx_personal_events_date ON personal_events(event_date);
@@ -51,3 +61,5 @@ CREATE INDEX IF NOT EXISTS idx_personal_events_cat ON personal_events(category);
 CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(username);
 CREATE INDEX IF NOT EXISTS idx_transactions_entity ON transactions(entity_person);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
+CREATE INDEX IF NOT EXISTS idx_conv_chat ON conversation_history(chat_id, id DESC);
+

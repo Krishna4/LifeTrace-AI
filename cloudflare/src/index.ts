@@ -10,6 +10,7 @@ export interface Env {
   TELEGRAM_SECRET_TOKEN?: string;
   API_KEY?: string;
   DEFAULT_USER?: string;
+  USER_TIMEZONE?: string;
   ENVIRONMENT?: string;
 }
 
@@ -38,7 +39,17 @@ app.use('/api/v1/*', async (c, next) => {
 
 // --- Helper Functions ---
 
-async function sendTelegramMessage(token: string, chatId: string, text: string, parseMode: string = 'Markdown') {
+function getTodayDateStr(timezone?: string): string {
+  try {
+    const tz = timezone || 'Asia/Kolkata';
+    return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+  } catch {
+    return new Date().toISOString().split('T')[0];
+  }
+}
+
+async function sendTelegramMessage(token: string, chatId: string, text: string, parseMode?: string) {
+  const mode = parseMode === undefined ? 'Markdown' : parseMode;
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   try {
     const res = await fetch(url, {
@@ -47,20 +58,49 @@ async function sendTelegramMessage(token: string, chatId: string, text: string, 
       body: JSON.stringify({
         chat_id: chatId,
         text: text,
-        parse_mode: parseMode,
+        ...(mode ? { parse_mode: mode } : {}),
         disable_web_page_preview: true,
       }),
     });
-    return await res.json();
+    const data: any = await res.json();
+    // Resilient fallback: If Telegram rejects Markdown entities (e.g. unclosed underscores), retry in plain text
+    if (!data.ok && mode) {
+      console.warn(`Telegram markdown parse error: ${data.description}. Retrying without formatting.`);
+      const retryRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text,
+          disable_web_page_preview: true,
+        }),
+      });
+      return await retryRes.json();
+    }
+    return data;
   } catch (err) {
     console.error('Telegram dispatch error:', err);
     return { ok: false, error: String(err) };
   }
 }
 
-function formatEventsForDigest(events: any[], targetDateStr: string, username: string): string {
-  if (!events || events.length === 0) {
-    return `🌱 *LifeTrace AI Daily Agenda*\n📅 *${targetDateStr}* (User: \`${username}\`)\n\n🎉 _No events or meetings scheduled for today._`;
+function formatEventsForDigest(
+  events: any[],
+  targetDateStr: string,
+  username: string,
+  expenses: any[] = []
+): string {
+  const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+  const hasEvents = events && events.length > 0;
+  const hasExpenses = expenses && expenses.length > 0;
+
+  if (!hasEvents && !hasExpenses) {
+    return (
+      `🌱 *LifeTrace AI Daily Agenda*\n` +
+      `📅 *${targetDateStr}* (User: \`${username}\`)\n\n` +
+      `🎉 _No events, meetings, or expenses logged for today._\n\n` +
+      `_Tip: Log events with \`/log <details>\` or expenses with \`/spend <amount> <item>\`._`
+    );
   }
 
   const icons: Record<string, string> = {
@@ -71,24 +111,259 @@ function formatEventsForDigest(events: any[], targetDateStr: string, username: s
     MILESTONE: '🏆',
     REMINDER: '⏰',
     DAILY_EVENT: '📌',
+    WORK: '💼',
   };
 
-  const blocks = events.map((ev, i) => {
-    const icon = icons[ev.category?.toUpperCase()] || '📌';
-    let line = `*${i + 1}.* ${icon} *[${ev.category}]* *${ev.title}*`;
-    if (ev.location) line += `\n   📍 Location: ${ev.location}`;
-    if (ev.entity_person) line += `\n   👤 Person: ${ev.entity_person}`;
-    if (ev.details) line += `\n   📝 Details: _${ev.details}_`;
-    return line;
-  });
+  let output = `🌱 *LifeTrace AI Daily Agenda*\n📅 *${targetDateStr}* (User: \`${username}\`)\n\n`;
 
-  return (
-    `🌱 *LifeTrace AI Daily Agenda*\n` +
-    `📅 *${targetDateStr}* (User: \`${username}\`)\n` +
-    `🔔 *${events.length} event(s) scheduled:*\n\n` +
-    blocks.join('\n\n') +
-    `\n\n_Reply to this chat to ask questions or log new activities!_`
-  );
+  if (hasEvents) {
+    const blocks = events.map((ev, i) => {
+      const icon = icons[ev.category?.toUpperCase()] || '📌';
+      let line = `*${i + 1}.* (ID: \`#${ev.id}\`) ${icon} *[${ev.category}]* *${ev.title}*`;
+      if (ev.location) line += `\n   📍 Location: ${ev.location}`;
+      if (ev.entity_person) line += `\n   👤 Person: ${ev.entity_person}`;
+      if (ev.details) line += `\n   📝 Details: _${ev.details}_`;
+      return line;
+    });
+    output += `🔔 *${events.length} event(s) scheduled:*\n${blocks.join('\n\n')}\n\n`;
+  }
+
+  if (hasExpenses) {
+    const expenseLines = expenses.map((tx) => {
+      const sym = symbolMap[tx.currency] || `${tx.currency} `;
+      return `• (ID: \`#${tx.id}\`) *${tx.entity_person}:* ${sym}${tx.amount} (${tx.currency})${tx.notes && tx.notes !== tx.entity_person ? ` — _${tx.notes}_` : ''}`;
+    });
+    output += `💰 *Today's Expenses (${expenses.length}):*\n${expenseLines.join('\n')}\n\n`;
+  }
+
+  output += `_Reply to ask questions, log new activities, or manage entries!_`;
+  return output;
+}
+
+
+async function extractAndLogEvent(
+  env: Env,
+  rawText: string,
+  username: string
+): Promise<{ success: boolean; event: any }> {
+  const todayStr = new Date().toISOString().split('T')[0];
+  let parsed: any = null;
+
+  try {
+    const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
+      messages: [
+        {
+          role: 'system',
+          content: `You are an event extraction engine for a personal life ledger. Today's date is ${todayStr}.
+Extract the event details into a single JSON object with this exact schema:
+{
+  "title": "Concise summary of event (e.g. Attended AI Workshop in Office)",
+  "category": "WORK" | "MEETING" | "TRAVEL" | "HEALTH" | "DINING" | "MILESTONE" | "DAILY_EVENT",
+  "event_date": "YYYY-MM-DD (resolve words like today, tomorrow, yesterday relative to ${todayStr})",
+  "location": "location if mentioned or null",
+  "entity_person": "people mentioned or null",
+  "details": "extra details, commentary, or duration"
+}
+Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or extra explanation.`,
+        },
+        { role: 'user', content: rawText },
+      ],
+      max_tokens: 300,
+      temperature: 0.1,
+    });
+
+    let responseText = '';
+    if (typeof aiRes === 'string') {
+      responseText = aiRes;
+    } else if (aiRes && typeof aiRes === 'object') {
+      responseText = (aiRes as any).response || (aiRes as any).result?.response || JSON.stringify(aiRes);
+    }
+
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      parsed = JSON.parse(jsonMatch[0]);
+    }
+  } catch (err) {
+    console.warn('AI event extraction warning:', err);
+  }
+
+  const title = parsed?.title || rawText.slice(0, 80);
+  const category = (parsed?.category || 'DAILY_EVENT').toUpperCase();
+  const eventDate = parsed?.event_date || todayStr;
+  const location = parsed?.location || null;
+  const entityPerson = parsed?.entity_person || null;
+  const details = parsed?.details || rawText;
+
+  const stmt = env.DB.prepare(`
+    INSERT INTO personal_events (title, category, event_date, location, entity_person, details, username)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const res = await stmt.bind(title, category, eventDate, location, entityPerson, details, username).run();
+  const eventId = res.meta.last_row_id;
+
+  // Embed and index into Vectorize
+  try {
+    const textToEmbed = `Personal Event (${eventDate}) [${category}]: ${title}${location ? ` at ${location}` : ''}${entityPerson ? ` with ${entityPerson}` : ''}${details ? `. Details: ${details}` : ''}`;
+    const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+    const vector = embedRes.data[0];
+    await env.VECTORIZE.upsert([
+      {
+        id: `event-${eventId}`,
+        values: vector,
+        metadata: {
+          type: 'event',
+          id: eventId,
+          title,
+          category,
+          event_date: eventDate,
+          username,
+          text: textToEmbed,
+        },
+      },
+    ]);
+  } catch (err) {
+    console.warn('Vectorize index warning on Telegram log:', err);
+  }
+
+  return {
+    success: true,
+    event: { id: eventId, title, category, event_date: eventDate, location, entity_person: entityPerson, details },
+  };
+}
+
+async function extractAndLogExpense(
+  env: Env,
+  rawText: string,
+  username: string
+): Promise<{ success: boolean; tx: any }> {
+  const todayStr = getTodayDateStr(env.USER_TIMEZONE);
+  let parsed: any = null;
+
+  // 1. Fast deterministic regex extraction
+  let regexAmount: number | null = null;
+  let regexCurrency = 'USD';
+  let regexEntity = 'General Expense';
+  let regexNotes = rawText.trim();
+
+  // Check currency symbols / codes anywhere in text
+  if (/₹|\bINR\b/i.test(rawText)) regexCurrency = 'INR';
+  else if (/€|\bEUR\b/i.test(rawText)) regexCurrency = 'EUR';
+  else if (/£|\bGBP\b/i.test(rawText)) regexCurrency = 'GBP';
+
+  // Match amount anywhere in string: e.g. "50 groceries", "$50 dinner", "lunch 20.50", "petrol 500 INR"
+  const numberMatch = rawText.match(/(?:([$₹€£])\s*)?(\d+(?:\.\d{1,2})?)(?:\s*([A-Za-z]{3}))?/);
+  if (numberMatch && numberMatch[2]) {
+    regexAmount = parseFloat(numberMatch[2]);
+    if (numberMatch[1]) {
+      if (numberMatch[1] === '₹') regexCurrency = 'INR';
+      else if (numberMatch[1] === '€') regexCurrency = 'EUR';
+      else if (numberMatch[1] === '£') regexCurrency = 'GBP';
+    }
+    if (numberMatch[3]) {
+      const code = numberMatch[3].toUpperCase();
+      if (['USD', 'INR', 'EUR', 'GBP', 'CAD', 'AUD', 'SGD'].includes(code)) {
+        regexCurrency = code;
+      }
+    }
+
+    // Derive entity by stripping the amount and common prepositions
+    const stripped = rawText
+      .replace(numberMatch[0], '')
+      .replace(/[$₹€£]/g, '')
+      .replace(/\b(for|on|at|to|spent|bought|paid|INR|USD|EUR|GBP)\b/gi, '')
+      .trim();
+    if (stripped) {
+      regexEntity = stripped;
+      regexNotes = stripped;
+    }
+  }
+
+  // 2. AI Extraction for deeper context and classification
+  try {
+    const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
+      messages: [
+        {
+          role: 'system',
+          content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
+Extract the transaction into a single JSON object with this schema:
+{
+  "entity_person": "Vendor, item, or category (e.g. Starbucks, Groceries, Uber, Petrol)",
+  "amount": number,
+  "currency": "USD" | "INR" | "EUR" | "GBP",
+  "transaction_date": "YYYY-MM-DD (resolve words like yesterday relative to ${todayStr})",
+  "notes": "additional notes or description"
+}
+Return ONLY valid JSON without markdown code fences:`,
+        },
+        { role: 'user', content: rawText },
+      ],
+      max_tokens: 300,
+      temperature: 0.1,
+    });
+
+    let responseText = '';
+    if (typeof aiRes === 'string') {
+      responseText = aiRes;
+    } else if (aiRes && typeof aiRes === 'object') {
+      responseText = (aiRes as any).response || (aiRes as any).result?.response || JSON.stringify(aiRes);
+    }
+
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      parsed = JSON.parse(jsonMatch[0]);
+    }
+  } catch (err) {
+    console.warn('AI expense extraction warning:', err);
+  }
+
+  // Deterministic values always take precedence or fallback seamlessly
+  const finalAmount = (regexAmount !== null && regexAmount > 0)
+    ? regexAmount
+    : (Number(parsed?.amount) || 0);
+
+  const entity = (parsed?.entity_person && parsed.entity_person !== 'General Expense')
+    ? parsed.entity_person
+    : regexEntity;
+
+  const currency = (parsed?.currency || regexCurrency || 'USD').toUpperCase();
+  const txDate = parsed?.transaction_date || todayStr;
+  const notes = parsed?.notes || regexNotes || rawText;
+
+  const stmt = env.DB.prepare(`
+    INSERT INTO transactions (entity_person, amount, currency, transaction_date, notes, username)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const res = await stmt.bind(entity, finalAmount, currency, txDate, notes, username).run();
+  const txId = res.meta.last_row_id;
+
+  try {
+    const textToEmbed = `Financial Transaction: Paid/received ${currency} ${finalAmount} for ${entity} on ${txDate}.${notes ? ` Notes: ${notes}` : ''}`;
+    const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+    const vector = embedRes.data[0];
+    await env.VECTORIZE.upsert([
+      {
+        id: `tx-${txId}`,
+        values: vector,
+        metadata: {
+          type: 'transaction',
+          id: txId,
+          entity_person: entity,
+          amount: finalAmount,
+          currency,
+          transaction_date: txDate,
+          username,
+          text: textToEmbed,
+        },
+      },
+    ]);
+  } catch (err) {
+    console.warn('Vectorize transaction index warning on Telegram log:', err);
+  }
+
+  return {
+    success: true,
+    tx: { id: txId, entity_person: entity, amount: finalAmount, currency, transaction_date: txDate, notes },
+  };
 }
 
 // --- API Routes ---
@@ -310,29 +585,26 @@ app.post('/api/v1/documents', async (c) => {
   return c.json({ id: docId, message: 'Document saved and indexed.' }, 201);
 });
 
-// 4. Multimodal RAG Query Engine (Workers AI + D1 + Vectorize)
-app.post('/api/v1/query', async (c) => {
-  const body = await c.req.json();
-  const query = body.query;
-  const username = body.username || c.env.DEFAULT_USER || 'default_user';
-
-  if (!query) {
-    return c.json({ error: 'Query is required' }, 400);
-  }
-
+// 4. Multimodal RAG Query Engine Helper (with Conversation Memory)
+async function executeRagQuery(
+  env: Env,
+  query: string,
+  username: string,
+  chatId?: string
+): Promise<{ query: string; answer: string; events: any[]; transactions: any[]; vector_matches: number }> {
   // A. Semantic Search in Vectorize (Dense Vector Similarity)
   let vectorHits: any[] = [];
   try {
-    const embedRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [query] });
+    const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [query] });
     const queryVector = embedRes.data[0];
-    const vecResults = await c.env.VECTORIZE.query(queryVector, { topK: 5, returnMetadata: 'all' });
+    const vecResults = await env.VECTORIZE.query(queryVector, { topK: 5, returnMetadata: 'all' });
     vectorHits = vecResults.matches || [];
   } catch (err) {
     console.warn('Vector search warning:', err);
   }
 
   // B. Relational Matching in D1
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayDateStr(env.USER_TIMEZONE);
   const qLower = query.toLowerCase();
 
   // Date check
@@ -361,7 +633,7 @@ app.post('/api/v1/query', async (c) => {
       eventParams.push(term, term, term, term);
     }
     eventSql += ' ORDER BY event_date DESC LIMIT 5';
-    const { results } = await c.env.DB.prepare(eventSql).bind(...eventParams).all();
+    const { results } = await env.DB.prepare(eventSql).bind(...eventParams).all();
     matchingEvents = results || [];
   } catch (e) {
     console.warn('D1 events query error:', e);
@@ -372,12 +644,12 @@ app.post('/api/v1/query', async (c) => {
   const isFinancial = qLower.includes('pay') || qLower.includes('spent') || qLower.includes('cost') || qLower.includes('$') || qLower.includes('money') || qLower.includes('transaction');
   try {
     if (isFinancial) {
-      const { results } = await c.env.DB.prepare(
+      const { results } = await env.DB.prepare(
         'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC LIMIT 5'
       ).bind(username).all();
       matchingTx = results || [];
     } else {
-      const { results } = await c.env.DB.prepare(
+      const { results } = await env.DB.prepare(
         'SELECT * FROM transactions WHERE username = ? AND (LOWER(entity_person) LIKE ? OR LOWER(notes) LIKE ?) ORDER BY transaction_date DESC LIMIT 5'
       ).bind(username, `%${qLower}%`, `%${qLower}%`).all();
       matchingTx = results || [];
@@ -409,20 +681,54 @@ app.post('/api/v1/query', async (c) => {
     contextParts.push(`Financial Records:\n${matchingTx.map(t => `- Paid/received $${t.amount} ${t.currency} with ${t.entity_person} on ${t.transaction_date}${t.notes ? ` (${t.notes})` : ''}`).join('\n')}`);
   }
 
-  let finalAnswer = '';
-  if (contextParts.length > 0) {
+  // 4. Conversation History (Multi-turn chat memory)
+  const recentHistory: { role: string; content: string }[] = [];
+  if (chatId) {
     try {
-      const aiRes = await c.env.AI.run('@cf/meta/llama-3.3-70b-instruct', {
-        messages: [
-          { role: 'system', content: 'You are an accurate, grounded personal assistant. Answer questions concisely using ONLY the provided context. If the answer is found in the context, be clear and direct. Do NOT hallucinate.' },
-          { role: 'user', content: `Context:\n${contextParts.join('\n\n')}\n\nUser Question: ${query}\nAnswer:` }
-        ],
+      const { results } = await env.DB.prepare(
+        'SELECT role, content FROM conversation_history WHERE chat_id = ? ORDER BY id DESC LIMIT 6'
+      ).bind(chatId).all();
+      if (results && results.length > 0) {
+        for (let i = results.length - 1; i >= 0; i--) {
+          const row: any = results[i];
+          recentHistory.push({
+            role: row.role === 'assistant' ? 'assistant' : 'user',
+            content: row.content,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to load conversation history:', err);
+    }
+  }
+
+  let finalAnswer = '';
+  if (contextParts.length > 0 || recentHistory.length > 0) {
+    const systemPrompt = `You are an accurate, grounded personal assistant. Answer questions concisely using the provided context and conversation history. If the answer is found in the context or past messages, be clear and direct. Do NOT hallucinate.\n\nContext:\n${contextParts.join('\n\n')}`;
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...recentHistory,
+      { role: 'user', content: query },
+    ];
+
+    try {
+      const aiRes = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        messages,
         max_tokens: 500,
         temperature: 0.1,
       });
       finalAnswer = (aiRes as any)?.response || '';
     } catch (err) {
-      console.warn('Workers AI answer generation warning:', err);
+      console.warn('Llama 3.3 failed, falling back to Llama 3.1:', err);
+      try {
+        const fallbackRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
+          messages,
+          max_tokens: 500,
+        });
+        finalAnswer = (fallbackRes as any)?.response || '';
+      } catch (e) {
+        console.warn('Workers AI answer generation warning:', e);
+      }
     }
   }
 
@@ -444,16 +750,52 @@ app.post('/api/v1/query', async (c) => {
     finalAnswer = `No records found matching '${query}' in your ledger or notes.`;
   }
 
-  return c.json({
+  // Persist conversation history turn into D1
+  if (chatId && finalAnswer) {
+    try {
+      await env.DB.prepare(
+        'INSERT INTO conversation_history (chat_id, role, content, username) VALUES (?, ?, ?, ?)'
+      ).bind(chatId, 'user', query, username).run();
+
+      await env.DB.prepare(
+        'INSERT INTO conversation_history (chat_id, role, content, username) VALUES (?, ?, ?, ?)'
+      ).bind(chatId, 'assistant', finalAnswer, username).run();
+
+      // Prune history to last 20 messages per chat
+      await env.DB.prepare(`
+        DELETE FROM conversation_history 
+        WHERE chat_id = ? AND id NOT IN (
+          SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY id DESC LIMIT 20
+        )
+      `).bind(chatId, chatId).run();
+    } catch (err) {
+      console.warn('Failed to save conversation history:', err);
+    }
+  }
+
+  return {
     query,
     answer: finalAnswer,
     events: matchingEvents,
     transactions: matchingTx,
     vector_matches: vectorHits.length,
-  });
+  };
+}
+
+app.post('/api/v1/query', async (c) => {
+  const body = await c.req.json();
+  const query = body.query;
+  const username = body.username || c.env.DEFAULT_USER || 'default_user';
+
+  if (!query) {
+    return c.json({ error: 'Query is required' }, 400);
+  }
+
+  const result = await executeRagQuery(c.env, query, username);
+  return c.json(result);
 });
 
-// 4. Telegram Webhook Receiver (Listens to DM & Channel Posts)
+// 5. Telegram Webhook Receiver (Listens to DM & Channel Posts)
 app.post('/telegram/webhook', async (c) => {
   const update = await c.req.json();
   const token = c.env.TELEGRAM_BOT_TOKEN;
@@ -476,7 +818,7 @@ app.post('/telegram/webhook', async (c) => {
 
   const chatId = String(message.chat.id);
   const text = message.text.trim();
-  const username = c.env.DEFAULT_USER || 'default_user';
+  const username = c.env.DEFAULT_USER || message.from?.username || message.from?.first_name || 'default_user';
 
   // 2. Chat ID Guard: Only permit interaction from the configured owner chat or channel
   const authorizedChatId = c.env.TELEGRAM_CHAT_ID;
@@ -486,59 +828,190 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: false, error: 'Unauthorized chat ID' }, 403);
   }
 
-  // Commands
-  if (text.startsWith('/start') || text.startsWith('/help')) {
+  // 1. Normalize and parse Telegram command
+  const normalizedText = text.replace(/^\/([a-zA-Z0-9_]+)@[a-zA-Z0-9_]+/i, '/$1').trim();
+  const parts = normalizedText.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const args = normalizedText.slice(parts[0].length).trim();
+
+  // /start or /help: Display clean command guide
+  if (cmd === '/start' || cmd === '/help') {
     const helpMsg = 
-      `🌱 *LifeTrace AI — Cloudflare Edge Assistant*\n\n` +
-      `Commands:\n` +
-      `• \`/today\` — Today's scheduled events\n` +
-      `• \`/events\` — Recent personal events\n` +
-      `• \`/expenses\` — Recent financial records\n` +
-      `• \`/digest\` — Send full daily agenda\n\n` +
-      `Or ask me any question directly!`;
+      `🌱 *LifeTrace AI — Command Directory*\n\n` +
+      `📅 *View Your Agenda & History:*\n` +
+      `• \`/today\` or \`/digest\` — View today's agenda & expenses\n` +
+      `• \`/today YYYY-MM-DD\` — View agenda for a specific date\n` +
+      `• \`/events\` — List recent life events\n` +
+      `• \`/expenses\` — List recent financial transactions\n\n` +
+      `✍️ *Log Events & Transactions:*\n` +
+      `• \`/log <details>\` — Log an event (e.g. \`/log AI workshop at office 10am\`)\n` +
+      `• \`/spend <amount> <description>\` — Log an expense (e.g. \`/spend 50 groceries\`, \`/spend $20 lunch\`, \`/spend 500 INR petrol\`)\n\n` +
+      `🗑️ *Manage Entries:*\n` +
+      `• \`/delete <id>\` — Delete an event by ID (e.g. \`/delete 5\`)\n` +
+      `• \`/delete_expense <id>\` — Delete a transaction by ID (e.g. \`/delete_expense 2\`)\n` +
+      `• \`/clear\` or \`/reset\` — Clear conversational memory\n\n` +
+      `💬 *Or talk naturally!* Ask questions like _"What did I do yesterday?"_ or _"How much did I spend on groceries?"_ with multi-turn memory.`;
     await sendTelegramMessage(token, chatId, helpMsg);
     return c.json({ ok: true });
   }
 
-  if (text.startsWith('/today') || text.startsWith('/digest')) {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
-    ).bind(username, todayStr).all();
-    const digestText = formatEventsForDigest(results || [], todayStr, username);
+  // 1. Pure View Commands: strictly /today or /digest
+  if (cmd === '/today' || cmd === '/digest') {
+    const isExplicitDate = args && /^\d{4}-\d{2}-\d{2}$/.test(args);
+    const targetDate = isExplicitDate ? args : getTodayDateStr(c.env.USER_TIMEZONE);
+
+    const [{ results: eventResults }, { results: txResults }] = await Promise.all([
+      c.env.DB.prepare(
+        'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
+      ).bind(username, targetDate).all(),
+      c.env.DB.prepare(
+        'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id DESC'
+      ).bind(username, targetDate).all(),
+    ]);
+
+    let digestText = formatEventsForDigest(eventResults || [], targetDate, username, txResults || []);
+
+    if (args && !isExplicitDate) {
+      digestText += `\n\n💡 *Tip:* \`/digest\` displays your agenda. If you meant to log an event, use:\n\`/log ${args}\``;
+    }
+
     await sendTelegramMessage(token, chatId, digestText);
     return c.json({ ok: true });
   }
 
-  if (text.startsWith('/events')) {
+  // /clear or /reset: Wipe conversational memory
+  if (cmd === '/clear' || cmd === '/reset') {
+    await c.env.DB.prepare('DELETE FROM conversation_history WHERE chat_id = ?').bind(chatId).run();
+    await sendTelegramMessage(token, chatId, '🧹 *Conversation memory cleared!* We can start a fresh topic.');
+    return c.json({ ok: true });
+  }
+
+  // /events: View recent events
+  if (cmd === '/events') {
     const { results } = await c.env.DB.prepare(
       'SELECT * FROM personal_events WHERE username = ? ORDER BY event_date DESC LIMIT 5'
     ).bind(username).all();
-    const lines = (results || []).map((e: any) => `• *[${e.category}]* ${e.title} (${e.event_date})`);
-    const reply = lines.length ? `📅 *Recent Events:*\n${lines.join('\n')}` : 'No events found.';
+    const lines = (results || []).map((e: any) => `• (ID: \`#${e.id}\`) *[${e.category}]* ${e.title} (${e.event_date})`);
+    const reply = lines.length ? `📅 *Recent Events:*\n${lines.join('\n')}\n\n_Tip: Type /delete <id> to remove an entry._` : 'No events found.';
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
 
-  if (text.startsWith('/expenses')) {
+  // /expenses: View recent expenses
+  if (cmd === '/expenses') {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC LIMIT 5'
+      'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC, id DESC LIMIT 5'
     ).bind(username).all();
-    const lines = (results || []).map((t: any) => `• *${t.entity_person}:* $${t.amount} ${t.currency} on ${t.transaction_date}`);
-    const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}` : 'No transactions found.';
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const lines = (results || []).map((t: any) => {
+      const sym = symbolMap[t.currency] || `${t.currency} `;
+      return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${t.amount} (${t.currency}) on \`${t.transaction_date}\``;
+    });
+    const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
 
-  // Natural Language Question via Edge RAG
+  // /delete: Delete event
+  if (cmd === '/delete' || cmd === '/delete_event') {
+    const eventId = Number(args);
+    if (!eventId || isNaN(eventId)) {
+      await sendTelegramMessage(token, chatId, '⚠️ Please provide a valid event ID. Example: `/delete 5`');
+      return c.json({ ok: true });
+    }
+    await c.env.DB.prepare('DELETE FROM personal_events WHERE id = ? AND username = ?').bind(eventId, username).run();
+    try {
+      await c.env.VECTORIZE.deleteByIds([`event-${eventId}`]);
+    } catch {}
+    await sendTelegramMessage(token, chatId, `🗑️ Event #${eventId} deleted from your ledger.`);
+    return c.json({ ok: true });
+  }
+
+  // /delete_expense: Delete expense
+  if (cmd === '/delete_expense') {
+    const txId = Number(args);
+    if (!txId || isNaN(txId)) {
+      await sendTelegramMessage(token, chatId, '⚠️ Please provide a valid transaction ID. Example: `/delete_expense 2`');
+      return c.json({ ok: true });
+    }
+    await c.env.DB.prepare('DELETE FROM transactions WHERE id = ? AND username = ?').bind(txId, username).run();
+    try {
+      await c.env.VECTORIZE.deleteByIds([`tx-${txId}`]);
+    } catch {}
+    await sendTelegramMessage(token, chatId, `🗑️ Transaction #${txId} deleted from your ledger.`);
+    return c.json({ ok: true });
+  }
+
+  // /spend or /expense: Log financial transaction
+  if (cmd === '/spend' || cmd === '/expense') {
+    if (!args) {
+      await sendTelegramMessage(
+        token,
+        chatId,
+        '⚠️ *Please specify the amount and item.*\n\nExamples:\n• `/spend 50 groceries`\n• `/spend $20 lunch with Sarah`\n• `/spend 500 INR petrol`\n• `/spend coffee 4.50`'
+      );
+      return c.json({ ok: true });
+    }
+    const { tx } = await extractAndLogExpense(c.env, args, username);
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    const reply = 
+      `💰 *Expense Logged:*\n` +
+      `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+      `• *Amount:* ${sym}${tx.amount} (${tx.currency})\n` +
+      `• *Date:* \`${tx.transaction_date}\`\n` +
+      (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
+      `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // /log or /event or /add: Explicit event logging
+  if (cmd === '/log' || cmd === '/event' || cmd === '/add') {
+    if (!args) {
+      await sendTelegramMessage(token, chatId, '⚠️ Please specify the event details.\nExample: `/log attended AI workshop in office today`');
+      return c.json({ ok: true });
+    }
+    const { event } = await extractAndLogEvent(c.env, args, username);
+    const reply = 
+      `✅ *Event Logged:*\n` +
+      `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
+      `🏷️ *Category:* \`${event.category}\`\n` +
+      `📅 *Date:* \`${event.event_date}\`\n` +
+      (event.location ? `📍 *Location:* ${event.location}\n` : '') +
+      (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
+      (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
+      `\n_Type /today to view your updated agenda!_`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // Heuristic for natural language event logging (only if clearly expressing an action or diary entry)
+  const isQuestion = text.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|show|list)\b/i.test(text);
+  const isEventStatement = !isQuestion && (
+    /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(text) ||
+    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(text)
+  );
+
+  if (isEventStatement) {
+    const { event } = await extractAndLogEvent(c.env, text, username);
+    const reply = 
+      `✅ *Event Logged:*\n` +
+      `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
+      `🏷️ *Category:* \`${event.category}\`\n` +
+      `📅 *Date:* \`${event.event_date}\`\n` +
+      (event.location ? `📍 *Location:* ${event.location}\n` : '') +
+      (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
+      (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
+      `\n_Type /today to view your agenda, or ask any question!_`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // Natural Language Question via Edge RAG with conversational multi-turn memory
   try {
-    const queryRes = await app.request('/api/v1/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, username }),
-    }, c.env);
-    const data: any = await queryRes.json();
-    await sendTelegramMessage(token, chatId, `🌱 *LifeTrace AI:*\n\n${data.answer}`);
+    const result = await executeRagQuery(c.env, text, username, chatId);
+    await sendTelegramMessage(token, chatId, `🌱 *LifeTrace AI:*\n\n${result.answer}`);
   } catch (err) {
     await sendTelegramMessage(token, chatId, `⚠️ Error processing request: ${err}`);
   }
@@ -555,7 +1028,7 @@ app.post('/api/v1/telegram/publish-digest', async (c) => {
   }
 
   const username = c.req.query('username') || c.env.DEFAULT_USER || 'default_user';
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayDateStr(c.env.USER_TIMEZONE);
 
   const { results } = await c.env.DB.prepare(
     'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
@@ -584,7 +1057,7 @@ export default {
     }
 
     const username = env.DEFAULT_USER || 'default_user';
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayDateStr(env.USER_TIMEZONE);
 
     const { results } = await env.DB.prepare(
       'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'

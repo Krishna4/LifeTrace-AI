@@ -7,7 +7,8 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "personal-rag-db"
-database_id = "YOUR_D1_DATABASE_ID_HERE"
+database_id = "8c1850a2-5e7a-45a9-81f1-8fa696e3e6ac"
+
 
 # 2. Cloudflare Vectorize Vector Database
 [[vectorize]]
@@ -18,13 +19,16 @@ index_name = "personal-rag-vectors"
 [ai]
 binding = "AI"
 
-# 4. Automated Daily Morning Agenda Cron (Runs at 8:00 AM UTC / adjust for timezone)
+# 4. Automated Daily Morning Agenda Cron (Runs at 8:00 AM IST = 02:30 UTC)
 [triggers]
-crons = ["0 8 * * *"]
+crons = ["30 2 * * *"]
 
 # 5. Environment Variables & Secrets (Set via: npx wrangler secret put <NAME>)
 # - TELEGRAM_BOT_TOKEN
 # - TELEGRAM_CHAT_ID
+# - API_KEY
 [vars]
 ENVIRONMENT = "production"
 DEFAULT_USER = "default_user"
+USER_TIMEZONE = "Asia/Kolkata"
+

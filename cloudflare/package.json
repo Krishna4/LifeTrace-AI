@@ -4,6 +4,7 @@
   "description": "100% Native Cloudflare Serverless Personal RAG & Telegram Life Ledger",
   "main": "src/index.ts",
   "scripts": {
+    "setup": "bash setup.sh",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "d1:create": "wrangler d1 create personal-rag-db",
