@@ -84,21 +84,80 @@ async function sendTelegramMessage(token: string, chatId: string, text: string, 
   }
 }
 
+interface DailyDigestData {
+  todayEvents: any[];
+  reminders: any[];
+  upcomingEvents: any[];
+  todayExpenses: any[];
+}
+
+async function getDailyDigestData(
+  env: Env,
+  username: string,
+  targetDate: string
+): Promise<DailyDigestData> {
+  const [
+    { results: todayEvents },
+    { results: reminders },
+    { results: upcomingEvents },
+    { results: todayExpenses },
+  ] = await Promise.all([
+    // 1. Events on target date
+    env.DB.prepare(
+      'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id ASC'
+    ).bind(username, targetDate).all(),
+
+    // 2. Active reminders (daily habits / persistent reminders)
+    env.DB.prepare(
+      `SELECT * FROM personal_events 
+       WHERE username = ? 
+         AND (category = 'REMINDER' OR LOWER(title) LIKE '%reminder%' OR LOWER(title) LIKE '%daily%' OR LOWER(details) LIKE '%daily%')
+         AND event_date <= ?
+       ORDER BY id DESC LIMIT 10`
+    ).bind(username, targetDate).all(),
+
+    // 3. Upcoming events in next 3 days
+    env.DB.prepare(
+      `SELECT * FROM personal_events 
+       WHERE username = ? 
+         AND event_date > ? 
+         AND event_date <= date(?, '+3 days') 
+       ORDER BY event_date ASC, id ASC LIMIT 5`
+    ).bind(username, targetDate, targetDate).all(),
+
+    // 4. Transactions for target date
+    env.DB.prepare(
+      'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id ASC'
+    ).bind(username, targetDate).all(),
+  ]);
+
+  // Deduplicate: Don't repeat today's events in active reminders
+  const todayIds = new Set((todayEvents || []).map((e: any) => e.id));
+  const filteredReminders = (reminders || []).filter((r: any) => !todayIds.has(r.id));
+
+  return {
+    todayEvents: todayEvents || [],
+    reminders: filteredReminders,
+    upcomingEvents: upcomingEvents || [],
+    todayExpenses: todayExpenses || [],
+  };
+}
+
 function formatEventsForDigest(
-  events: any[],
   targetDateStr: string,
   username: string,
-  expenses: any[] = []
+  data: DailyDigestData
 ): string {
   const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
-  const hasEvents = events && events.length > 0;
-  const hasExpenses = expenses && expenses.length > 0;
+  const { todayEvents, reminders, upcomingEvents, todayExpenses } = data;
 
-  if (!hasEvents && !hasExpenses) {
+  const totalItems = todayEvents.length + reminders.length + upcomingEvents.length + todayExpenses.length;
+
+  if (totalItems === 0) {
     return (
       `🌱 *LifeTrace AI Daily Agenda*\n` +
       `📅 *${targetDateStr}* (User: \`${username}\`)\n\n` +
-      `🎉 _No events, meetings, or expenses logged for today._\n\n` +
+      `🎉 _No events, reminders, or expenses scheduled for today._\n\n` +
       `_Tip: Log events with \`/log <details>\` or expenses with \`/spend <amount> <item>\`._`
     );
   }
@@ -114,10 +173,11 @@ function formatEventsForDigest(
     WORK: '💼',
   };
 
-  let output = `🌱 *LifeTrace AI Daily Agenda*\n📅 *${targetDateStr}* (User: \`${username}\`)\n\n`;
+  let output = `🌱 *LifeTrace AI Daily Briefing*\n📅 *${targetDateStr}* (User: \`${username}\`)\n\n`;
 
-  if (hasEvents) {
-    const blocks = events.map((ev, i) => {
+  // 1. Today's Events
+  if (todayEvents.length > 0) {
+    const blocks = todayEvents.map((ev, i) => {
       const icon = icons[ev.category?.toUpperCase()] || '📌';
       let line = `*${i + 1}.* (ID: \`#${ev.id}\`) ${icon} *[${ev.category}]* *${ev.title}*`;
       if (ev.location) line += `\n   📍 Location: ${ev.location}`;
@@ -125,28 +185,47 @@ function formatEventsForDigest(
       if (ev.details) line += `\n   📝 Details: _${ev.details}_`;
       return line;
     });
-    output += `🔔 *${events.length} event(s) scheduled:*\n${blocks.join('\n\n')}\n\n`;
+    output += `🔔 *Today's Schedule (${todayEvents.length}):*\n${blocks.join('\n\n')}\n\n`;
   }
 
-  if (hasExpenses) {
-    const expenseLines = expenses.map((tx) => {
+  // 2. Active Reminders & Daily Habits
+  if (reminders.length > 0) {
+    const remBlocks = reminders.map((r) => {
+      let line = `• (ID: \`#${r.id}\`) ⏰ *${r.title}*`;
+      if (r.details && r.details !== r.title) line += ` — _${r.details}_`;
+      return line;
+    });
+    output += `⏰ *Active Reminders & Daily Habits (${reminders.length}):*\n${remBlocks.join('\n')}\n\n`;
+  }
+
+  // 3. Upcoming in Next 3 Days
+  if (upcomingEvents.length > 0) {
+    const upBlocks = upcomingEvents.map((up) => {
+      const icon = icons[up.category?.toUpperCase()] || '🗓️';
+      return `• \`${up.event_date}\`: ${icon} *${up.title}*${up.location ? ` (${up.location})` : ''}`;
+    });
+    output += `🗓️ *Upcoming in Next 3 Days:*\n${upBlocks.join('\n')}\n\n`;
+  }
+
+  // 4. Today's Expenses
+  if (todayExpenses.length > 0) {
+    const expenseLines = todayExpenses.map((tx) => {
       const sym = symbolMap[tx.currency] || `${tx.currency} `;
       return `• (ID: \`#${tx.id}\`) *${tx.entity_person}:* ${sym}${tx.amount} (${tx.currency})${tx.notes && tx.notes !== tx.entity_person ? ` — _${tx.notes}_` : ''}`;
     });
-    output += `💰 *Today's Expenses (${expenses.length}):*\n${expenseLines.join('\n')}\n\n`;
+    output += `💰 *Today's Expenses (${todayExpenses.length}):*\n${expenseLines.join('\n')}\n\n`;
   }
 
   output += `_Reply to ask questions, log new activities, or manage entries!_`;
   return output;
 }
 
-
 async function extractAndLogEvent(
   env: Env,
   rawText: string,
   username: string
-): Promise<{ success: boolean; event: any }> {
-  const todayStr = new Date().toISOString().split('T')[0];
+): Promise<{ success: boolean; events: any[]; event: any }> {
+  const todayStr = getTodayDateStr(env.USER_TIMEZONE);
   let parsed: any = null;
 
   try {
@@ -155,20 +234,27 @@ async function extractAndLogEvent(
         {
           role: 'system',
           content: `You are an event extraction engine for a personal life ledger. Today's date is ${todayStr}.
-Extract the event details into a single JSON object with this exact schema:
+Analyze the user's message. If it contains ONE OR MORE events, reminders, or tasks, extract ALL of them into a JSON object with this exact schema:
 {
-  "title": "Concise summary of event (e.g. Attended AI Workshop in Office)",
-  "category": "WORK" | "MEETING" | "TRAVEL" | "HEALTH" | "DINING" | "MILESTONE" | "DAILY_EVENT",
-  "event_date": "YYYY-MM-DD (resolve words like today, tomorrow, yesterday relative to ${todayStr})",
-  "location": "location if mentioned or null",
-  "entity_person": "people mentioned or null",
-  "details": "extra details, commentary, or duration"
+  "events": [
+    {
+      "title": "Concise summary of event (e.g. Attended AI Workshop in Office)",
+      "category": "WORK" | "MEETING" | "TRAVEL" | "HEALTH" | "DINING" | "MILESTONE" | "REMINDER" | "DAILY_EVENT",
+      "event_date": "YYYY-MM-DD (resolve words like today, tomorrow, yesterday relative to ${todayStr})",
+      "location": "location if mentioned or null",
+      "entity_person": "people mentioned or null",
+      "details": "extra details, commentary, or duration"
+    }
+  ]
 }
-Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or extra explanation.`,
+Rules:
+1. If the message contains multiple activities, distinct items, or a numbered/bulleted list, extract EACH item as a separate object in the "events" array.
+2. If an item is a daily reminder or recurring task (e.g., "daily reminder", "remember every day", "daily habit"), set category to "REMINDER".
+3. Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or extra explanation.`,
         },
         { role: 'user', content: rawText },
       ],
-      max_tokens: 300,
+      max_tokens: 600,
       temperature: 0.1,
     });
 
@@ -187,47 +273,95 @@ Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or 
     console.warn('AI event extraction warning:', err);
   }
 
-  const title = parsed?.title || rawText.slice(0, 80);
-  const category = (parsed?.category || 'DAILY_EVENT').toUpperCase();
-  const eventDate = parsed?.event_date || todayStr;
-  const location = parsed?.location || null;
-  const entityPerson = parsed?.entity_person || null;
-  const details = parsed?.details || rawText;
+  // Normalize parsed output into an array of events
+  let rawList: any[] = [];
+  if (Array.isArray(parsed?.events) && parsed.events.length > 0) {
+    rawList = parsed.events;
+  } else if (parsed?.title) {
+    rawList = [parsed];
+  } else {
+    // Fallback: split on newlines if multiple lines, else single event
+    const lines = rawText.split('\n').map(l => l.trim().replace(/^[-*•\d.]+\s*/, '')).filter(l => l.length > 0);
+    if (lines.length > 1) {
+      rawList = lines.map(line => ({
+        title: line.slice(0, 80),
+        category: /reminder|daily/i.test(line) ? 'REMINDER' : 'DAILY_EVENT',
+        event_date: todayStr,
+        details: line,
+      }));
+    } else {
+      rawList = [{
+        title: rawText.slice(0, 80),
+        category: /reminder|daily/i.test(rawText) ? 'REMINDER' : 'DAILY_EVENT',
+        event_date: todayStr,
+        details: rawText,
+      }];
+    }
+  }
 
-  const stmt = env.DB.prepare(`
-    INSERT INTO personal_events (title, category, event_date, location, entity_person, details, username)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const res = await stmt.bind(title, category, eventDate, location, entityPerson, details, username).run();
-  const eventId = res.meta.last_row_id;
+  const savedEvents: any[] = [];
 
-  // Embed and index into Vectorize
-  try {
-    const textToEmbed = `Personal Event (${eventDate}) [${category}]: ${title}${location ? ` at ${location}` : ''}${entityPerson ? ` with ${entityPerson}` : ''}${details ? `. Details: ${details}` : ''}`;
-    const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
-    const vector = embedRes.data[0];
-    await env.VECTORIZE.upsert([
-      {
-        id: `event-${eventId}`,
-        values: vector,
-        metadata: {
-          type: 'event',
-          id: eventId,
-          title,
-          category,
-          event_date: eventDate,
-          username,
-          text: textToEmbed,
-        },
-      },
-    ]);
-  } catch (err) {
-    console.warn('Vectorize index warning on Telegram log:', err);
+  for (const item of rawList) {
+    const title = item.title || rawText.slice(0, 80);
+    let category = (item.category || 'DAILY_EVENT').toUpperCase();
+    if (/reminder|daily/i.test(title) || /reminder|daily/i.test(item.details || '')) {
+      category = 'REMINDER';
+    }
+    const eventDate = item.event_date || todayStr;
+    const location = item.location || null;
+    const entityPerson = item.entity_person || null;
+    const details = item.details || null;
+
+    try {
+      const stmt = env.DB.prepare(`
+        INSERT INTO personal_events (title, category, event_date, location, entity_person, details, username)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const res = await stmt.bind(title, category, eventDate, location, entityPerson, details, username).run();
+      const eventId = res.meta.last_row_id;
+
+      // Embed and index into Vectorize
+      try {
+        const textToEmbed = `Personal Event (${eventDate}) [${category}]: ${title}${location ? ` at ${location}` : ''}${entityPerson ? ` with ${entityPerson}` : ''}${details ? `. Details: ${details}` : ''}`;
+        const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+        const vector = embedRes.data[0];
+        await env.VECTORIZE.upsert([
+          {
+            id: `event-${eventId}`,
+            values: vector,
+            metadata: {
+              type: 'event',
+              id: eventId,
+              title,
+              category,
+              event_date: eventDate,
+              username,
+              text: textToEmbed,
+            },
+          },
+        ]);
+      } catch (err) {
+        console.warn('Vectorize index warning on Telegram log:', err);
+      }
+
+      savedEvents.push({
+        id: eventId,
+        title,
+        category,
+        event_date: eventDate,
+        location,
+        entity_person: entityPerson,
+        details,
+      });
+    } catch (dbErr) {
+      console.error('Failed to insert event into D1:', dbErr);
+    }
   }
 
   return {
-    success: true,
-    event: { id: eventId, title, category, event_date: eventDate, location, entity_person: entityPerson, details },
+    success: savedEvents.length > 0,
+    events: savedEvents,
+    event: savedEvents[0] || null,
   };
 }
 
@@ -893,16 +1027,8 @@ app.post('/telegram/webhook', async (c) => {
     const isExplicitDate = args && /^\d{4}-\d{2}-\d{2}$/.test(args);
     const targetDate = isExplicitDate ? args : getTodayDateStr(c.env.USER_TIMEZONE);
 
-    const [{ results: eventResults }, { results: txResults }] = await Promise.all([
-      c.env.DB.prepare(
-        'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
-      ).bind(username, targetDate).all(),
-      c.env.DB.prepare(
-        'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id DESC'
-      ).bind(username, targetDate).all(),
-    ]);
-
-    let digestText = formatEventsForDigest(eventResults || [], targetDate, username, txResults || []);
+    const digestData = await getDailyDigestData(c.env, username, targetDate);
+    let digestText = formatEventsForDigest(targetDate, username, digestData);
 
     if (args && !isExplicitDate) {
       digestText += `\n\n💡 *Tip:* \`/digest\` displays your agenda. If you meant to log an event, use:\n\`/log ${args}\``;
@@ -1002,19 +1128,31 @@ app.post('/telegram/webhook', async (c) => {
   // /log or /event or /add: Explicit event logging
   if (cmd === '/log' || cmd === '/event' || cmd === '/add') {
     if (!args) {
-      await sendTelegramMessage(token, chatId, '⚠️ Please specify the event details.\nExample: `/log attended AI workshop in office today`');
+      await sendTelegramMessage(token, chatId, '⚠️ Please specify the event details.\nExample: `/log attended AI workshop in office today`\nOr multiple: `/log 1. Team sync at 10am 2. Dentist at 3pm`');
       return c.json({ ok: true });
     }
-    const { event } = await extractAndLogEvent(c.env, args, username);
-    const reply = 
-      `✅ *Event Logged:*\n` +
-      `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
-      `🏷️ *Category:* \`${event.category}\`\n` +
-      `📅 *Date:* \`${event.event_date}\`\n` +
-      (event.location ? `📍 *Location:* ${event.location}\n` : '') +
-      (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
-      (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
-      `\n_Type /today to view your updated agenda!_`;
+    const { events } = await extractAndLogEvent(c.env, args, username);
+    if (!events || events.length === 0) {
+      await sendTelegramMessage(token, chatId, '⚠️ Could not save event. Please try again.');
+      return c.json({ ok: true });
+    }
+
+    let reply = '';
+    if (events.length === 1) {
+      const event = events[0];
+      reply = 
+        `✅ *Event Logged:*\n` +
+        `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
+        `🏷️ *Category:* \`${event.category}\`\n` +
+        `📅 *Date:* \`${event.event_date}\`\n` +
+        (event.location ? `📍 *Location:* ${event.location}\n` : '') +
+        (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
+        (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
+        `\n_Type /today to view your updated agenda!_`;
+    } else {
+      const items = events.map((ev, i) => `*${i + 1}.* 📌 *${ev.title}* (ID: \`#${ev.id}\`) — \`${ev.event_date}\` [${ev.category}]`).join('\n');
+      reply = `✅ *Logged ${events.length} Events:*\n\n${items}\n\n_Type /today to view your updated agenda!_`;
+    }
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
@@ -1027,18 +1165,27 @@ app.post('/telegram/webhook', async (c) => {
   );
 
   if (isEventStatement) {
-    const { event } = await extractAndLogEvent(c.env, text, username);
-    const reply = 
-      `✅ *Event Logged:*\n` +
-      `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
-      `🏷️ *Category:* \`${event.category}\`\n` +
-      `📅 *Date:* \`${event.event_date}\`\n` +
-      (event.location ? `📍 *Location:* ${event.location}\n` : '') +
-      (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
-      (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
-      `\n_Type /today to view your agenda, or ask any question!_`;
-    await sendTelegramMessage(token, chatId, reply);
-    return c.json({ ok: true });
+    const { events } = await extractAndLogEvent(c.env, text, username);
+    if (events && events.length > 0) {
+      let reply = '';
+      if (events.length === 1) {
+        const event = events[0];
+        reply = 
+          `✅ *Event Logged:*\n` +
+          `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
+          `🏷️ *Category:* \`${event.category}\`\n` +
+          `📅 *Date:* \`${event.event_date}\`\n` +
+          (event.location ? `📍 *Location:* ${event.location}\n` : '') +
+          (event.entity_person ? `👤 *With:* ${event.entity_person}\n` : '') +
+          (event.details ? `📝 *Notes:* _${event.details}_\n` : '') +
+          `\n_Type /today to view your agenda, or ask any question!_`;
+      } else {
+        const items = events.map((ev, i) => `*${i + 1}.* 📌 *${ev.title}* (ID: \`#${ev.id}\`) — \`${ev.event_date}\` [${ev.category}]`).join('\n');
+        reply = `✅ *Logged ${events.length} Events:*\n\n${items}\n\n_Type /today to view your agenda, or ask any question!_`;
+      }
+      await sendTelegramMessage(token, chatId, reply);
+      return c.json({ ok: true });
+    }
   }
 
   // Natural Language Question via Edge RAG with conversational multi-turn memory
@@ -1067,15 +1214,15 @@ app.post('/api/v1/telegram/publish-digest', async (c) => {
   const username = c.req.query('username') || c.env.DEFAULT_USER || 'default_user';
   const todayStr = getTodayDateStr(c.env.USER_TIMEZONE);
 
-  const { results } = await c.env.DB.prepare(
-    'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
-  ).bind(username, todayStr).all();
-
-  const msg = formatEventsForDigest(results || [], todayStr, username);
+  const digestData = await getDailyDigestData(c.env, username, todayStr);
+  const msg = formatEventsForDigest(todayStr, username, digestData);
   const delivery = await sendTelegramMessage(token, chatId, msg);
 
   return c.json({
-    events_count: results?.length || 0,
+    today_events_count: digestData.todayEvents.length,
+    reminders_count: digestData.reminders.length,
+    upcoming_events_count: digestData.upcomingEvents.length,
+    today_expenses_count: digestData.todayExpenses.length,
     delivery,
   });
 });
@@ -1096,11 +1243,8 @@ export default {
     const username = env.DEFAULT_USER || 'default_user';
     const todayStr = getTodayDateStr(env.USER_TIMEZONE);
 
-    const { results } = await env.DB.prepare(
-      'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id DESC'
-    ).bind(username, todayStr).all();
-
-    const msg = formatEventsForDigest(results || [], todayStr, username);
+    const digestData = await getDailyDigestData(env, username, todayStr);
+    const msg = formatEventsForDigest(todayStr, username, digestData);
     ctx.waitUntil(sendTelegramMessage(token, chatId, msg));
   },
 };
