@@ -877,32 +877,40 @@ async function executeRagQuery(
   }
 
   let finalAnswer = '';
-  if (contextParts.length > 0 || recentHistory.length > 0) {
-    const systemPrompt = `You are an accurate, grounded personal assistant. Answer questions concisely using the provided context and conversation history. If the answer is found in the context or past messages, be clear and direct. Do NOT hallucinate.\n\nContext:\n${contextParts.join('\n\n')}`;
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...recentHistory,
-      { role: 'user', content: query },
-    ];
+  const hasPersonalContext = contextParts.length > 0;
+  const systemPrompt = `You are LifeTrace AI, a knowledgeable, concise, and helpful personal AI assistant and second brain. Today's date is ${todayStr}.
+${hasPersonalContext ? `\nPersonal Ledger, Notes & Records:\n${contextParts.join('\n\n')}\n` : ''}
+Instructions:
+1. If the user's query asks about their personal life, schedule, expenses, notes, or history:
+   - Use the provided personal context to answer accurately and concisely.
+   - If no relevant records exist in their personal context, clearly inform them that you couldn't find any matching records in their ledger or notes.
+2. If the user's query is a GENERAL or GENERIC question (e.g., world knowledge, science, coding, recipes, writing, general advice, explanations, math):
+   - Answer helpfully, accurately, and concisely using your broad general knowledge.
+3. Be conversational, polite, and direct.`;
 
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...recentHistory,
+    { role: 'user', content: query },
+  ];
+
+  try {
+    const aiRes = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      messages,
+      max_tokens: 600,
+      temperature: 0.2,
+    });
+    finalAnswer = (aiRes as any)?.response || '';
+  } catch (err) {
+    console.warn('Llama 3.3 failed, falling back to Llama 3.1:', err);
     try {
-      const aiRes = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      const fallbackRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
         messages,
-        max_tokens: 500,
-        temperature: 0.1,
+        max_tokens: 600,
       });
-      finalAnswer = (aiRes as any)?.response || '';
-    } catch (err) {
-      console.warn('Llama 3.3 failed, falling back to Llama 3.1:', err);
-      try {
-        const fallbackRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
-          messages,
-          max_tokens: 500,
-        });
-        finalAnswer = (fallbackRes as any)?.response || '';
-      } catch (e) {
-        console.warn('Workers AI answer generation warning:', e);
-      }
+      finalAnswer = (fallbackRes as any)?.response || '';
+    } catch (e) {
+      console.warn('Workers AI answer generation warning:', e);
     }
   }
 
@@ -921,7 +929,7 @@ async function executeRagQuery(
     }
     finalAnswer = fallbackLines.join('\n\n');
   } else if (!finalAnswer) {
-    finalAnswer = `No records found matching '${query}' in your ledger or notes.`;
+    finalAnswer = `I'm having trouble processing that right now. Please try asking again.`;
   }
 
   // Collect traceable source citations from retrieved context
