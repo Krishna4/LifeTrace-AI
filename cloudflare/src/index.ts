@@ -194,7 +194,16 @@ function formatEventsForDigest(
       let line = `*${i + 1}.* (ID: \`#${ev.id}\`) ${icon} *[${ev.category}]* *${ev.title}*`;
       if (ev.location) line += `\n   📍 Location: ${ev.location}`;
       if (ev.entity_person) line += `\n   👤 Person: ${ev.entity_person}`;
-      if (ev.details) line += `\n   📝 Details: _${ev.details}_`;
+      const cleanDetails = ev.details?.trim();
+      if (cleanDetails) {
+        const titleNorm = ev.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const detailsNorm = cleanDetails.toLowerCase().replace(/\b(due\s+tomorrow|due\s+today|due|tomorrow|today|yesterday)\b/g, '').replace(/[^a-z0-9]/g, '');
+        const isRedundant = !detailsNorm || detailsNorm === titleNorm || cleanDetails.toLowerCase() === ev.title.toLowerCase();
+        if (!isRedundant) {
+          const sanitizedDetails = cleanDetails.replace(/\bdue\s+tomorrow\b/gi, 'due today');
+          line += `\n   📝 Details: _${sanitizedDetails}_`;
+        }
+      }
       return line;
     });
     output += `🔔 *Today's Schedule (${todayEvents.length}):*\n${blocks.join('\n\n')}\n\n`;
@@ -262,7 +271,8 @@ Analyze the user's message. If it contains ONE OR MORE events, reminders, or tas
 Rules:
 1. If the message contains multiple activities, distinct items, or a numbered/bulleted list, extract EACH item as a separate object in the "events" array.
 2. If an item is a daily reminder or recurring task (e.g., "daily reminder", "remember every day", "daily habit"), set category to "REMINDER".
-3. Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or extra explanation.`,
+3. In "details", include extra context, commentary, notes, or agenda if provided. DO NOT repeat the title, and DO NOT leave relative temporal phrases like "due tomorrow", "tomorrow", or "yesterday" in details because the exact date is already captured in "event_date". If there are no extra details beyond the title, set "details": null.
+4. Return ONLY the raw JSON object. Do not add markdown code fences, backticks, or extra explanation.`,
         },
         { role: 'user', content: rawText },
       ],
