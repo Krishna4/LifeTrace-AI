@@ -111,7 +111,19 @@ async function getDailyDigestData(
     env.DB.prepare(
       `SELECT * FROM personal_events 
        WHERE username = ? 
-         AND (category = 'REMINDER' OR LOWER(title) LIKE '%reminder%' OR LOWER(title) LIKE '%daily%' OR LOWER(details) LIKE '%daily%')
+         AND (
+           category = 'REMINDER' 
+           OR LOWER(title) LIKE '%remind%' 
+           OR LOWER(title) LIKE '%daily%' 
+           OR LOWER(title) LIKE '%everyday%' 
+           OR LOWER(title) LIKE '%every day%'
+           OR LOWER(details) LIKE '%remind%' 
+           OR LOWER(details) LIKE '%daily%' 
+           OR LOWER(details) LIKE '%everyday%' 
+           OR LOWER(details) LIKE '%every day%'
+           OR LOWER(details) LIKE '%recurring%'
+           OR LOWER(details) LIKE '%repeat%'
+         )
          AND event_date <= ?
        ORDER BY id DESC LIMIT 10`
     ).bind(username, targetDate).all(),
@@ -304,7 +316,11 @@ Rules:
   for (const item of rawList) {
     const title = item.title || rawText.slice(0, 80);
     let category = (item.category || 'DAILY_EVENT').toUpperCase();
-    if (/reminder|daily/i.test(title) || /reminder|daily/i.test(item.details || '')) {
+    if (
+      /reminder|remind|daily|everyday|every day|recurring|repeat/i.test(title) ||
+      /reminder|remind|daily|everyday|every day|recurring|repeat/i.test(item.details || '') ||
+      /reminder|remind|daily|everyday|every day|recurring|repeat/i.test(rawText)
+    ) {
       category = 'REMINDER';
     }
     const eventDate = item.event_date || todayStr;
@@ -773,7 +789,7 @@ async function executeRagQuery(
     const eventParams: any[] = [username];
 
     if (targetDate) {
-      eventSql += ' AND event_date = ?';
+      eventSql += ' AND (event_date = ? OR category = "REMINDER" OR LOWER(title) LIKE "%remind%" OR LOWER(title) LIKE "%daily%" OR LOWER(title) LIKE "%everyday%" OR LOWER(details) LIKE "%daily%" OR LOWER(details) LIKE "%everyday%")';
       eventParams.push(targetDate);
     } else {
       eventSql += ' AND (LOWER(title) LIKE ? OR LOWER(details) LIKE ? OR LOWER(entity_person) LIKE ? OR LOWER(location) LIKE ?)';
@@ -1125,10 +1141,10 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
-  // /log or /event or /add: Explicit event logging
-  if (cmd === '/log' || cmd === '/event' || cmd === '/add') {
+  // /log or /event or /add or /remind: Explicit event & reminder logging
+  if (cmd === '/log' || cmd === '/event' || cmd === '/add' || cmd === '/remind') {
     if (!args) {
-      await sendTelegramMessage(token, chatId, '⚠️ Please specify the event details.\nExample: `/log attended AI workshop in office today`\nOr multiple: `/log 1. Team sync at 10am 2. Dentist at 3pm`');
+      await sendTelegramMessage(token, chatId, '⚠️ Please specify the event or reminder details.\nExample: `/log attended AI workshop in office today`\nOr reminder: `/remind check application status everyday`\nOr multiple: `/log 1. Team sync at 10am 2. Dentist at 3pm`');
       return c.json({ ok: true });
     }
     const { events } = await extractAndLogEvent(c.env, args, username);
@@ -1140,8 +1156,9 @@ app.post('/telegram/webhook', async (c) => {
     let reply = '';
     if (events.length === 1) {
       const event = events[0];
+      const isRem = event.category === 'REMINDER';
       reply = 
-        `✅ *Event Logged:*\n` +
+        `${isRem ? '⏰ *Reminder Logged:*' : '✅ *Event Logged:*'}\n` +
         `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
         `🏷️ *Category:* \`${event.category}\`\n` +
         `📅 *Date:* \`${event.event_date}\`\n` +
@@ -1151,17 +1168,19 @@ app.post('/telegram/webhook', async (c) => {
         `\n_Type /today to view your updated agenda!_`;
     } else {
       const items = events.map((ev, i) => `*${i + 1}.* 📌 *${ev.title}* (ID: \`#${ev.id}\`) — \`${ev.event_date}\` [${ev.category}]`).join('\n');
-      reply = `✅ *Logged ${events.length} Events:*\n\n${items}\n\n_Type /today to view your updated agenda!_`;
+      reply = `✅ *Logged ${events.length} Items:*\n\n${items}\n\n_Type /today to view your updated agenda!_`;
     }
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
 
-  // Heuristic for natural language event logging (only if clearly expressing an action or diary entry)
+  // Heuristic for natural language event & reminder logging
   const isQuestion = text.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|show|list)\b/i.test(text);
   const isEventStatement = !isQuestion && (
     /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(text) ||
-    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(text)
+    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(text) ||
+    /^(remind me|reminder|set a reminder|remember to|don't forget|dont forget)\b/i.test(text) ||
+    /\b(everyday|every day|daily reminder)\b/i.test(text)
   );
 
   if (isEventStatement) {
@@ -1170,8 +1189,9 @@ app.post('/telegram/webhook', async (c) => {
       let reply = '';
       if (events.length === 1) {
         const event = events[0];
+        const isRem = event.category === 'REMINDER';
         reply = 
-          `✅ *Event Logged:*\n` +
+          `${isRem ? '⏰ *Reminder Logged:*' : '✅ *Event Logged:*'}\n` +
           `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
           `🏷️ *Category:* \`${event.category}\`\n` +
           `📅 *Date:* \`${event.event_date}\`\n` +
@@ -1181,7 +1201,7 @@ app.post('/telegram/webhook', async (c) => {
           `\n_Type /today to view your agenda, or ask any question!_`;
       } else {
         const items = events.map((ev, i) => `*${i + 1}.* 📌 *${ev.title}* (ID: \`#${ev.id}\`) — \`${ev.event_date}\` [${ev.category}]`).join('\n');
-        reply = `✅ *Logged ${events.length} Events:*\n\n${items}\n\n_Type /today to view your agenda, or ask any question!_`;
+        reply = `✅ *Logged ${events.length} Items:*\n\n${items}\n\n_Type /today to view your agenda, or ask any question!_`;
       }
       await sendTelegramMessage(token, chatId, reply);
       return c.json({ ok: true });
