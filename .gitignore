@@ -23,6 +23,7 @@ env/
 *.sqlite3
 personal_rag.db
 lancedb_data/
+cloudflare/import_*.sql
 .lancedb/
 
 # Uploaded Files & Temporary Directories
