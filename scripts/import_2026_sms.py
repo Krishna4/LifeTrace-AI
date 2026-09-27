@@ -42,6 +42,12 @@ def extract_amount(body: str):
 
 def classify_direction(body: str) -> str:
     cleaned = re.sub(r'\bcredit\s*card\b', 'card', body, flags=re.IGNORECASE)
+
+    # Beneficiary transfer check (always a DEBIT for the user)
+    if re.search(r'credited to (?:beneficiary|payee|receiver|recipient|other)', cleaned, re.IGNORECASE) or \
+       re.search(r'(?:sent|transferred|paid)\s+(?:to|from|rs|inr|₹|[0-9]).*credited', cleaned, re.IGNORECASE):
+        return 'DEBIT'
+
     has_credit = bool(re.search(r'\b(credited|received|deposited|deposit|refund|refunded|cashback|salary|added to)\b', cleaned, re.IGNORECASE))
     has_debit = bool(re.search(r'\b(debited|spent|sent to|paid to|paid rs|paid inr|transferred to|charged|withdrawn|purchase at|txn of|used at)\b', cleaned, re.IGNORECASE))
     if has_credit and not has_debit:
